@@ -12,13 +12,11 @@ use crate::{m115::crypto, request::Ajax};
 
 const API_ADD_OFFLINE_URL: &str = "https://lixian.115.com/lixianssp/?ac=add_task_urls";
 const API_CLEAR_OFFLINE_URL: &str = "https://lixian.115.com/lixian/?ct=lixian&ac=task_clear";
-const API_FILE_LIST: &str = "https://webapi.115.com/files";
-const API_DIR_ADD: &str = "https://webapi.115.com/files/add";
 const API_STATUS_CHECK: &str = "https://my.115.com/?ct=guide&ac=status";
 const API_USER_INFO: &str = "https://my.115.com/?ct=ajax&ac=nav";
 const APP_VER: &str = "27.0.5.7";
 const UA_115_BROWSER: &str = "Mozilla/5.0 115Browser/27.0.5.7";
-const MAX_DIR_PAGE_LIMIT: i64 = 1150;
+const REQUIRED_COOKIE_NAMES: [&str; 3] = ["UID", "CID", "SEID"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pan115ErrorKind {
@@ -107,13 +105,16 @@ impl Pan115Client {
             .with_context(|| format!("request 115 api failed: {endpoint}"))?
             .error_for_status()
             .with_context(|| format!("115 api returned non-success status: {endpoint}"))?;
-        response
-            .json()
+        let body = response
+            .bytes()
             .await
-            .with_context(|| format!("decode 115 api response failed: {endpoint}"))
+            .with_context(|| format!("read 115 api response failed: {endpoint}"))?;
+        parse_json_response_bytes(&body)
+            .map_err(|err| anyhow!("decode 115 api response failed: {endpoint}; {err}"))
     }
 
     pub async fn ensure_logged_in(&self) -> Result<()> {
+        self.ensure_cookie_fields()?;
         if self.cookie_check().await? {
             Ok(())
         } else {
@@ -135,6 +136,11 @@ impl Pan115Client {
     async fn user_id(&self) -> Result<i64> {
         if let Some(user_id) = *self.user_id.lock().unwrap() {
             return Ok(user_id);
+        }
+
+        if let Some(cookie_uid) = self.cookie_uid() {
+            *self.user_id.lock().unwrap() = Some(cookie_uid);
+            return Ok(cookie_uid);
         }
 
         let value = self
@@ -170,24 +176,15 @@ impl Pan115Client {
         &self,
         uris: &[String],
         dir_id: Option<&str>,
+        savepath: Option<&str>,
     ) -> Result<Vec<String>> {
         if uris.is_empty() {
             return Ok(vec![]);
         }
 
         let key = crypto::gen_key();
-        let mut params = BTreeMap::new();
-        params.insert("ac".to_string(), "add_task_urls".to_string());
-        params.insert(
-            "wp_path_id".to_string(),
-            dir_id.unwrap_or_default().to_string(),
-        );
-        params.insert("app_ver".to_string(), APP_VER.to_string());
-        params.insert("uid".to_string(), self.user_id().await?.to_string());
-        for (index, uri) in uris.iter().enumerate() {
-            params.insert(format!("url[{index}]"), uri.to_string());
-        }
-
+        let params =
+            build_add_offline_params(uris, dir_id, savepath, self.user_id().await?.to_string());
         let params_json = serde_json::to_vec(&params)?;
         let encoded = crypto::encode(&params_json, &key);
         let value = self
@@ -221,120 +218,55 @@ impl Pan115Client {
         Ok(hashes)
     }
 
-    pub async fn resolve_target_dir(
-        &self,
-        cid: Option<&str>,
-        savepath: Option<&str>,
-    ) -> Result<Option<String>> {
-        let cid = cid.map(str::trim).filter(|value| !value.is_empty());
-        let savepath = savepath
-            .map(|value| value.replace('\\', "/"))
-            .and_then(|value| {
-                let trimmed = value.trim().trim_matches('/').to_string();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed)
-                }
-            });
-
-        let Some(savepath) = savepath else {
-            return Ok(cid.map(|value| value.to_string()));
-        };
-
-        let mut current = cid.unwrap_or("0").to_string();
-        for segment in savepath
-            .split('/')
-            .map(str::trim)
-            .filter(|segment| !segment.is_empty())
-        {
-            if segment == "." || segment == ".." {
-                bail!("invalid savepath segment: {segment}");
-            }
-            current = if let Some(found) = self.find_child_directory(&current, segment).await? {
-                found
-            } else {
-                self.mkdir(&current, segment).await?
-            };
+    fn ensure_cookie_fields(&self) -> Result<()> {
+        let cookie = self
+            .ajax
+            .cookie_for_host("115.com")
+            .context("115 cookies is required. Use --cookies or create a .cookies file")?;
+        let missing = REQUIRED_COOKIE_NAMES
+            .iter()
+            .copied()
+            .filter(|name| cookie_value(&cookie, name).is_none())
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(());
         }
-        Ok(Some(current))
+        bail!(
+            "115 cookies format error, missing {}. Use --cookies \"UID=...;CID=...;SEID=...;KID=...\" or create a .cookies file",
+            missing.join(", ")
+        )
     }
 
-    async fn find_child_directory(&self, parent_id: &str, name: &str) -> Result<Option<String>> {
-        let mut offset = 0;
-        loop {
-            let value = self.list_dir(parent_id, offset, MAX_DIR_PAGE_LIMIT).await?;
-            let total = value
-                .get("count")
-                .and_then(json_i64)
-                .unwrap_or_default()
-                .max(0);
-            if let Some(items) = value.get("data").and_then(|value| value.as_array()) {
-                for item in items {
-                    if !entry_is_directory(item) {
-                        continue;
-                    }
-                    if item_name(item).as_deref() == Some(name) {
-                        return Ok(entry_id(item));
-                    }
-                }
-            }
-            offset += MAX_DIR_PAGE_LIMIT;
-            if offset >= total {
-                return Ok(None);
-            }
-        }
+    fn cookie_uid(&self) -> Option<i64> {
+        self.ajax
+            .cookie_for_host("115.com")
+            .and_then(|cookie| cookie_value(&cookie, "UID"))
+            .and_then(|value| value.parse().ok())
+    }
+}
+
+fn build_add_offline_params(
+    uris: &[String],
+    dir_id: Option<&str>,
+    savepath: Option<&str>,
+    user_id: String,
+) -> BTreeMap<String, String> {
+    let mut params = BTreeMap::new();
+    params.insert("ac".to_string(), "add_task_urls".to_string());
+    params.insert("app_ver".to_string(), APP_VER.to_string());
+    params.insert("uid".to_string(), user_id);
+
+    if let Some(dir_id) = dir_id.map(str::trim).filter(|value| !value.is_empty()) {
+        params.insert("wp_path_id".to_string(), dir_id.to_string());
+    }
+    if let Some(savepath) = savepath.map(str::trim).filter(|value| !value.is_empty()) {
+        params.insert("savepath".to_string(), savepath.to_string());
+    }
+    for (index, uri) in uris.iter().enumerate() {
+        params.insert(format!("url[{index}]"), uri.to_string());
     }
 
-    async fn list_dir(&self, parent_id: &str, offset: i64, limit: i64) -> Result<Value> {
-        let value = self
-            .request_json(
-                self.req(Method::GET, API_FILE_LIST)?.query(&[
-                    ("aid", "1".to_string()),
-                    ("cid", parent_id.to_string()),
-                    ("o", "file_name".to_string()),
-                    ("asc", "1".to_string()),
-                    ("offset", offset.to_string()),
-                    ("show_dir", "1".to_string()),
-                    ("limit", limit.to_string()),
-                    ("snap", "0".to_string()),
-                    ("natsort", "0".to_string()),
-                    ("record_open_time", "1".to_string()),
-                    ("format", "json".to_string()),
-                    ("fc_mix", "0".to_string()),
-                ]),
-                API_FILE_LIST,
-            )
-            .await?;
-        ensure_success(&value)?;
-        Ok(value)
-    }
-
-    async fn mkdir(&self, parent_id: &str, name: &str) -> Result<String> {
-        let value = self
-            .request_json(
-                self.req(Method::POST, API_DIR_ADD)?
-                    .form(&[("pid", parent_id.to_string()), ("cname", name.to_string())]),
-                API_DIR_ADD,
-            )
-            .await?;
-        match ensure_success(&value) {
-            Ok(()) => value
-                .get("cid")
-                .and_then(json_string)
-                .context("missing cid in mkdir response"),
-            Err(err) => {
-                if let Some(api_err) = err.downcast_ref::<Pan115Error>() {
-                    if api_err.kind() == Pan115ErrorKind::Exist {
-                        if let Some(found) = self.find_child_directory(parent_id, name).await? {
-                            return Ok(found);
-                        }
-                    }
-                }
-                Err(err)
-            }
-        }
-    }
+    params
 }
 
 fn ensure_success(value: &Value) -> Result<()> {
@@ -389,31 +321,103 @@ fn json_bool(value: &Value) -> Option<bool> {
     }
 }
 
-fn json_string(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => Some(text.clone()),
-        Value::Number(number) => Some(number.to_string()),
-        _ => None,
+fn parse_json_response_bytes(body: &[u8]) -> Result<Value> {
+    let trimmed = trim_response_bytes(body);
+    if trimmed.is_empty() {
+        bail!("empty response body");
     }
+
+    if let Ok(value) = serde_json::from_slice(trimmed) {
+        return Ok(value);
+    }
+
+    let body = String::from_utf8_lossy(trimmed);
+    parse_json_response_text(&body)
 }
 
-fn item_name(value: &Value) -> Option<String> {
-    value.get("n").and_then(json_string)
+fn parse_json_response_text(body: &str) -> Result<Value> {
+    let trimmed = body.trim_start_matches('\u{feff}').trim();
+    if trimmed.is_empty() {
+        bail!("empty response body");
+    }
+
+    if let Ok(value) = serde_json::from_str(trimmed) {
+        return Ok(value);
+    }
+
+    if is_abnormal_operation_response(trimmed) {
+        bail!("115 abnormal operation");
+    }
+
+    if let Some(fragment) = extract_json_fragment(trimmed) {
+        if let Ok(value) = serde_json::from_str(fragment) {
+            return Ok(value);
+        }
+    }
+
+    bail!("body preview: {}", preview_body(trimmed))
 }
 
-fn entry_id(value: &Value) -> Option<String> {
-    value
-        .get("cid")
-        .and_then(json_string)
-        .or_else(|| value.get("fid").and_then(json_string))
+fn trim_response_bytes(body: &[u8]) -> &[u8] {
+    let body = body.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(body);
+    let start = body
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(body.len());
+    let end = body
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &body[start..end]
 }
 
-fn entry_is_directory(value: &Value) -> bool {
-    value
-        .get("fid")
-        .and_then(json_string)
-        .map(|fid| fid.is_empty())
-        .unwrap_or(true)
+fn is_abnormal_operation_response(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("abnormal operation")
+        || body.contains("操作异常")
+        || body.contains("异常验证")
+        || body.contains("验证码")
+}
+
+fn extract_json_fragment(body: &str) -> Option<&str> {
+    let start = body.find(['{', '['])?;
+    let end = body.rfind(['}', ']'])?;
+    if end <= start {
+        return None;
+    }
+    Some(body[start..=end].trim())
+}
+
+fn preview_body(body: &str) -> String {
+    const LIMIT: usize = 240;
+
+    let normalized = body.replace('\r', " ").replace('\n', " ");
+    let mut preview: String = normalized.chars().take(LIMIT).collect();
+    if normalized.chars().count() > LIMIT {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn cookie_value(cookie: &str, name: &str) -> Option<String> {
+    cookie
+        .split(';')
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .find_map(|segment| {
+            let (key, value) = segment.split_once('=')?;
+            if key.trim().eq_ignore_ascii_case(name) {
+                let value = value.trim();
+                if value.is_empty() {
+                    None
+                } else {
+                    Some(value.to_string())
+                }
+            } else {
+                None
+            }
+        })
 }
 
 fn now_secs() -> i64 {
@@ -447,5 +451,58 @@ mod tests {
             Pan115ErrorKind::TaskExisted
         );
         assert_eq!(Pan115Error::new(99, None).kind(), Pan115ErrorKind::NotLogin);
+    }
+
+    #[test]
+    fn test_parse_json_response_text_accepts_wrapped_json() {
+        let value = parse_json_response_text("callback({\"state\":true,\"errno\":0});").unwrap();
+        assert_eq!(value.get("state").and_then(json_bool), Some(true));
+    }
+
+    #[test]
+    fn test_parse_json_response_text_accepts_lossy_text() {
+        let raw = b"{\"state\":false,\"error\":\"\x80\"}";
+        let body = String::from_utf8_lossy(raw);
+        let value = parse_json_response_text(&body).unwrap();
+        assert_eq!(value.get("state").and_then(json_bool), Some(false));
+        assert!(value
+            .get("error")
+            .and_then(|value| value.as_str())
+            .is_some());
+    }
+
+    #[test]
+    fn test_parse_json_response_bytes_accepts_utf8_bom() {
+        let value = parse_json_response_bytes(b"\xef\xbb\xbf{\"state\":true}").unwrap();
+        assert_eq!(value.get("state").and_then(json_bool), Some(true));
+    }
+
+    #[test]
+    fn test_cookie_value_case_insensitive() {
+        let cookie = "uid=1; CID=2; seid=3; KID=4";
+        assert_eq!(cookie_value(cookie, "UID").as_deref(), Some("1"));
+        assert_eq!(cookie_value(cookie, "CID").as_deref(), Some("2"));
+        assert_eq!(cookie_value(cookie, "SEID").as_deref(), Some("3"));
+        assert_eq!(cookie_value(cookie, "KID").as_deref(), Some("4"));
+    }
+
+    #[test]
+    fn test_build_add_offline_params_matches_python_behavior() {
+        let params = build_add_offline_params(
+            &[String::from("magnet:?xt=urn:btih:hash-a")],
+            Some("123"),
+            Some("桜都字幕组"),
+            "1".to_string(),
+        );
+        assert_eq!(params.get("wp_path_id").map(String::as_str), Some("123"));
+        assert_eq!(
+            params.get("savepath").map(String::as_str),
+            Some("桜都字幕组")
+        );
+        assert_eq!(params.get("uid").map(String::as_str), Some("1"));
+        assert_eq!(
+            params.get("url[0]").map(String::as_str),
+            Some("magnet:?xt=urn:btih:hash-a")
+        );
     }
 }

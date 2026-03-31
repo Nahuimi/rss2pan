@@ -98,7 +98,7 @@ curl -H "Content-Type: application/json" -d "{\"tasks\":[\"magnet:?xt=urn:btih:x
     {
       "name": "VCB-Studio",
       "cid": "2479224057885794455",
-      "savepath": "番剧/VCB-Studio",
+      "savepath": "VCB-Studio",
       "url": "https://nyaa.si/?page=rss&u=VCB-Studio"
     }
   ],
@@ -129,7 +129,7 @@ curl -H "Content-Type: application/json" -d "{\"tasks\":[\"magnet:?xt=urn:btih:x
 
 cid 是离线到指定的文件夹的 id 。
 
-savepath 是可选项，用于在 `cid` 下面继续按路径查找/创建子目录；不设置时保持 115 默认行为。
+savepath 是可选项，直接作为 `add_task_urls` 请求体里的 `savepath` 字段提交给 115；不设置时保持 115 默认行为。
 
 获取方法: 浏览器打开 115 的文件，地址栏像 `https://115.com/?cid=2479224057885794455&offset=0&tab=&mode=wangpan`
 

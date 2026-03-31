@@ -66,13 +66,9 @@ async fn submit_links(
     cid: Option<&str>,
     savepath: Option<&str>,
 ) -> Result<()> {
-    let target_dir = pan115.resolve_target_dir(cid, savepath).await?;
     for (index, chunk) in links.chunks(options.chunk_size).enumerate() {
         let chunk_links = chunk.to_vec();
-        match pan115
-            .add_offline_urls(&chunk_links, target_dir.as_deref())
-            .await
-        {
+        match pan115.add_offline_urls(&chunk_links, cid, savepath).await {
             Ok(_) => {
                 log::info!("[server] add {} tasks", chunk.len());
             }

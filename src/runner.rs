@@ -134,12 +134,11 @@ impl TaskRunner {
         cid: Option<&str>,
         savepath: Option<&str>,
     ) -> Result<()> {
-        let target_dir = self.pan115.resolve_target_dir(cid, savepath).await?;
         for (index, chunk) in links.chunks(self.options.chunk_size).enumerate() {
             let chunk_links = chunk.to_vec();
             match self
                 .pan115
-                .add_offline_urls(&chunk_links, target_dir.as_deref())
+                .add_offline_urls(&chunk_links, cid, savepath)
                 .await
             {
                 Ok(_) => {
@@ -189,10 +188,6 @@ impl TaskRunner {
             return Ok(());
         }
 
-        let target_dir = self
-            .pan115
-            .resolve_target_dir(config.cid.as_deref(), config.savepath.as_deref())
-            .await?;
         for (index, chunk) in tasks.chunks(self.options.chunk_size).enumerate() {
             let links = chunk
                 .iter()
@@ -200,7 +195,7 @@ impl TaskRunner {
                 .collect::<Vec<_>>();
             match self
                 .pan115
-                .add_offline_urls(&links, target_dir.as_deref())
+                .add_offline_urls(&links, config.cid.as_deref(), config.savepath.as_deref())
                 .await
             {
                 Ok(_) => {

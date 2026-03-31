@@ -65,6 +65,34 @@ impl MyRSA {
             }
         }
     }
+
+    #[cfg(test)]
+    pub fn encrypt_with_deterministic_padding(&self, data: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for chunk in data.chunks(self.key_size - 11) {
+            self.encrypt_slice_with_fixed_padding(chunk, &mut buf);
+        }
+        buf
+    }
+
+    #[cfg(test)]
+    fn encrypt_slice_with_fixed_padding(&self, input: &[u8], buf: &mut Vec<u8>) {
+        let pad_size = self.key_size - input.len() - 3;
+        let mut msg_buf: Vec<u8> = vec![0; self.key_size];
+        msg_buf[1] = 2;
+        for i in 0..pad_size {
+            msg_buf[i + 2] = (i % 0xff) as u8 + 1;
+        }
+        msg_buf[pad_size + 2] = 0;
+        msg_buf[pad_size + 3..].clone_from_slice(input);
+        let msg = BigInt::from_bytes_be(Sign::Plus, msg_buf.as_slice());
+        let (_, ret) = msg.modpow(&self.e, &self.n).to_bytes_be();
+        if self.key_size > ret.len() {
+            let start_len = self.key_size - ret.len();
+            buf.extend(vec![0; start_len]);
+        }
+        buf.extend(ret);
+    }
 }
 
 #[cfg(test)]

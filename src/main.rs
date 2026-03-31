@@ -21,10 +21,7 @@ use utils::get_magnet_list_by_txt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
-    }
-    env_logger::init();
+    init_logger();
 
     let matches = build_app().get_matches();
     let ajax = Ajax::from_matches(&matches);
@@ -67,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if let Err(err) = runner.execute_links(&magnets, cid, savepath).await {
-            eprintln!("{err}");
+            print_error(&err);
             std::process::exit(1);
         }
         return Ok(());
@@ -76,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
     let service = RssService::new()?;
     if let Some(url) = matches.get_one::<String>("url") {
         if let Err(err) = runner.execute_url(&service, url).await {
-            eprintln!("{err}");
+            print_error(&err);
             std::process::exit(1);
         }
         return Ok(());
@@ -88,9 +85,33 @@ async fn main() -> anyhow::Result<()> {
         runner.execute_all(&service).await
     };
     if let Err(err) = result {
-        eprintln!("{err}");
+        print_error(&err);
         std::process::exit(1);
     }
 
     Ok(())
+}
+
+fn print_error(err: &anyhow::Error) {
+    eprintln!("{err}");
+    for cause in err.chain().skip(1) {
+        eprintln!("caused by: {cause}");
+    }
+}
+
+fn init_logger() {
+    use std::io::Write;
+
+    let env = env_logger::Env::default().default_filter_or("info");
+    let mut builder = env_logger::Builder::from_env(env);
+    builder.format(|buf, record| {
+        let level_style = buf.default_level_style(record.level());
+        writeln!(
+            buf,
+            "[{level_style}{}{level_style:#}] {}",
+            record.level(),
+            record.args()
+        )
+    });
+    builder.init();
 }

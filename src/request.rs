@@ -124,6 +124,11 @@ impl Ajax {
         }
     }
 
+    pub fn cookie_for_host(&self, host: &str) -> Option<String> {
+        let config = self.site_config.get(host);
+        self.resolved_cookie(host, config)
+    }
+
     fn build_headers(&self, host: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         let config = self.site_config.get(host);
