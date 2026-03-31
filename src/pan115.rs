@@ -392,7 +392,7 @@ fn extract_json_fragment(body: &str) -> Option<&str> {
 fn preview_body(body: &str) -> String {
     const LIMIT: usize = 240;
 
-    let normalized = body.replace('\r', " ").replace('\n', " ");
+    let normalized = body.replace(['\r', '\n'], " ");
     let mut preview: String = normalized.chars().take(LIMIT).collect();
     if normalized.chars().count() > LIMIT {
         preview.push_str("...");
