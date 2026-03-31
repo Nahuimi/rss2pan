@@ -62,7 +62,8 @@ rss2pan --chunk-size 100 --chunk-delay 3
 # 指定 rss URL 离线下载
 # 如果 rss.json 存在这条url 的配置，会读取配置。没有配置，默认离线到 115 的默认目录
 rss2pan -u "https://mikanani.me/RSS/Bangumi?bangumiId=2739&subgroupid=12"
-# 清理 115 离线任务。1-6 对齐 rss2cloud
+# --clear-task-type 清除离线任务。 1: 已完成的  2: 所有任务 3: 失败任务 4: 运行的任务 5: 完成并删除的任务 6: 所有的任务
+# 清除115任务列表里面已经完成的任务
 rss2pan --clear-task-type 1
 
 # 查看 magnet 子命令帮助

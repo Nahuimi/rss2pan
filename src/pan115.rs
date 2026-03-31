@@ -241,7 +241,7 @@ impl Pan115Client {
         self.ajax
             .cookie_for_host("115.com")
             .and_then(|cookie| cookie_value(&cookie, "UID"))
-            .and_then(|value| value.parse().ok())
+            .and_then(|value| extract_cookie_uid(&value))
     }
 }
 
@@ -420,6 +420,18 @@ fn cookie_value(cookie: &str, name: &str) -> Option<String> {
         })
 }
 
+fn extract_cookie_uid(value: &str) -> Option<i64> {
+    let digits = value
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -503,6 +515,14 @@ mod tests {
         assert_eq!(
             params.get("url[0]").map(String::as_str),
             Some("magnet:?xt=urn:btih:hash-a")
+        );
+    }
+
+    #[test]
+    fn test_extract_cookie_uid_from_prefixed_numeric_uid() {
+        assert_eq!(
+            extract_cookie_uid("34352253467_D1_17225283483"),
+            Some(34352253467)
         );
     }
 }
