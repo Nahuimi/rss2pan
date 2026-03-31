@@ -2,14 +2,11 @@
 
 将 RSS 订阅离线下载到 115 网盘。
 
-> [!note]  
-> Web API 会触发验证码
-> 推荐使用 [zhifengle/rss2cloud](https://github.com/zhifengle/rss2cloud)
-具体见 [#2](https://github.com/zhifengle/rss2pan/issues/2)
-
 ## 关于
 
-支持 RSS 源: nyaa, dmhy, mikanni
+这是 `rss2cloud` 的 Rust 实现，离线接口已切换到和 `github.com/SheltonZhu/115driver` 同一套加密 API。
+
+支持 RSS 源: nyaa, dmhy, mikanani, acgnx, rsshub
 
 <details>
 <summary><code><strong>「 点击查看 实现功能 」</strong></code></summary>
@@ -17,12 +14,17 @@
 - [x] 115 离线功能
 - [x] sqlite 存储数据
 - [x] 实现 cli
+- [x] `/add` HTTP API
+- [x] `savepath` 支持
+- [x] `--cookies`
+- [x] `--no-cache`
+- [x] `--clear-task-type`
+- [x] `--chunk-delay`
+- [x] `--chunk-size`
 - [x] proxy 配置
-  - ~~目前写死在 build_proxy_client 里面~~
   - 读取 ALL_PROXY 或者 HTTPS_PROXY 环境变量
 - [x] 正则过滤 filter
 - [ ] Windows 定时任务
-  - ~~懒得写了，我是手动配置的~~
 - [x] 不同网站的并发任务
 - [x] 指定 magnet 链接或者文件，离线到 115
 
@@ -31,6 +33,8 @@
 ## 用法
 
 在同一目录下面，配置好 `rss.json` 、 `node-site-config.json` 和 `.cookies`
+
+`.cookies` 已加入 `.gitignore`，不要把真实 cookie 提交到 Git 仓库。
 
 在命令行运行 `rss2pan`
 
@@ -48,24 +52,33 @@ rss2pan -h
 rss2pan
 # 并发请求 rss 网站。然后再添加 115 离线任务
 rss2pan -m
+# 使用 cookies
+rss2pan --cookies "UID=xxx;CID=xxx;SEID=xxx;KID=xxx"
+# 跳过 db.sqlite 缓存检查
+rss2pan --no-cache
+# 调整分块大小和间隔
+rss2pan --chunk-size 100 --chunk-delay 3
 
 # 指定 rss URL 离线下载
 # 如果 rss.json 存在这条url 的配置，会读取配置。没有配置，默认离线到 115 的默认目录
 rss2pan -u "https://mikanani.me/RSS/Bangumi?bangumiId=2739&subgroupid=12"
+# 清理 115 离线任务。1-6 对齐 rss2cloud
+rss2pan --clear-task-type 1
 
 # 查看 magnet 子命令帮助
 rss2pan magnet -h
-rss2pan magnet --link "magnet:?xt=urn:btih:12345" --cid "12345"
+rss2pan magnet --link "magnet:?xt=urn:btih:12345" --cid "12345" --savepath "番剧/测试"
 # 离线包含 magnet 的 txt 文件; 按行分割
-rss2pan magnet --txt magnet.txt --cid "12345"
+rss2pan magnet --txt magnet.txt --cid "12345" --savepath "番剧/测试"
+
+# 服务模式
+rss2pan server
+curl -H "Content-Type: application/json" -d "{\"tasks\":[\"magnet:?xt=urn:btih:xx\"],\"cid\":\"12345\",\"savepath\":\"番剧/测试\"}" -X POST http://localhost:8115/add
 ```
 
 ### 注意
 
 日志报 `115 abnormal operation` 时，说明账号触发了异常验证，需要在浏览器端手动离线，输入验证码后解除。
-
-_推荐使用_ [zhifengle/rss2cloud](https://github.com/zhifengle/rss2cloud)
-具体见 [#2](https://github.com/zhifengle/rss2pan/issues/2)
 
 ## 配置
 
@@ -85,6 +98,7 @@ _推荐使用_ [zhifengle/rss2cloud](https://github.com/zhifengle/rss2cloud)
     {
       "name": "VCB-Studio",
       "cid": "2479224057885794455",
+      "savepath": "番剧/VCB-Studio",
       "url": "https://nyaa.si/?page=rss&u=VCB-Studio"
     }
   ],
@@ -100,6 +114,7 @@ _推荐使用_ [zhifengle/rss2cloud](https://github.com/zhifengle/rss2cloud)
       "name": "水星的魔女",
       "filter": "简日双语",
       "cid": "2479224057885794455",
+      "savepath": "番剧/水星的魔女",
       "url": "https://share.dmhy.org/topics/rss/rss.xml?keyword=%E6%B0%B4%E6%98%9F%E7%9A%84%E9%AD%94%E5%A5%B3&sort_id=2&team_id=0&order=date-desc"
     }
   ]
@@ -110,9 +125,11 @@ _推荐使用_ [zhifengle/rss2cloud](https://github.com/zhifengle/rss2cloud)
 
 配置了 `filter` 后，标题包含该文字的会被离线。不设置 `filter` 默认离线全部
 
-`/简体|\\d{3-4}[pP]/` 使用斜线包裹的正则规则。注意转义规则
+`/简体|\\d{3,4}[pP]/` 使用斜线包裹的正则规则。注意转义规则
 
 cid 是离线到指定的文件夹的 id 。
+
+savepath 是可选项，用于在 `cid` 下面继续按路径查找/创建子目录；不设置时保持 115 默认行为。
 
 获取方法: 浏览器打开 115 的文件，地址栏像 `https://115.com/?cid=2479224057885794455&offset=0&tab=&mode=wangpan`
 
@@ -152,7 +169,8 @@ cid 是离线到指定的文件夹的 id 。
 
 #### cookie 配置
 
-在 `node-site-config.json` 文件里面配置 115.com cookie
+在 `node-site-config.json` 文件里面配置 115.com cookie。
+如果这个文件会被提交，务必只保留示例值；实际使用更推荐 `.cookies` 或 `--cookies`。
 
 ```json
 {
@@ -166,7 +184,7 @@ cid 是离线到指定的文件夹的 id 。
 
 ### proxy 配置
 
-设置【httpsAgent】会使用代理。默认使用的地址 `http://127.0.0.1:10809`。
+设置【httpsAgent】会使用代理。默认使用的地址 `http://127.0.0.1:10808`。
 
 > 【httpsAgent】沿用的 node 版的配置。
 

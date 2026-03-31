@@ -1,24 +1,23 @@
 mod app;
 mod db;
 mod downloader;
+mod m115;
+mod pan115;
 mod request;
 mod rss_config;
 mod rss_site;
+mod runner;
+mod server;
 mod utils;
-mod yiyiwu;
-// mod m115;
 
 use std::path::PathBuf;
 
 use app::build_app;
 use db::RssService;
-use once_cell::sync::OnceCell;
+use pan115::Pan115Client;
 use request::Ajax;
+use runner::{RunOptions, TaskRunner};
 use utils::get_magnet_list_by_txt;
-use yiyiwu::{execute_all_rss_task, execute_magnets_task, execute_tasks, execute_url_task};
-
-static AJAX_INSTANCE: OnceCell<Ajax> = OnceCell::new();
-static RSS_JSON: OnceCell<Option<PathBuf>> = OnceCell::new();
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,51 +25,71 @@ async fn main() -> anyhow::Result<()> {
         std::env::set_var("RUST_LOG", "info");
     }
     env_logger::init();
-    let app = build_app();
-    let matches = app.get_matches();
-    AJAX_INSTANCE.get_or_init(|| Ajax::from_matches(&matches));
-    RSS_JSON.get_or_init(|| matches.get_one::<PathBuf>("rss").map(|p| p.clone()));
+
+    let matches = build_app().get_matches();
+    let ajax = Ajax::from_matches(&matches);
+    let pan115 = Pan115Client::new(ajax.clone());
+    let rss_path = matches.get_one::<PathBuf>("rss").cloned();
+    let runner = TaskRunner::new(
+        pan115.clone(),
+        ajax,
+        rss_path,
+        RunOptions::from_matches(&matches),
+    );
+
+    if let Some(clear_task_type) = matches.get_one::<u8>("clear-task-type").copied() {
+        pan115.ensure_logged_in().await?;
+        pan115.clear_offline_tasks(clear_task_type - 1).await?;
+        return Ok(());
+    }
+
+    if let Some(("server", matches)) = matches.subcommand() {
+        pan115.ensure_logged_in().await?;
+        let port = matches.get_one::<u16>("port").copied().unwrap_or(8115);
+        server::serve(pan115, runner.options(), port).await?;
+        return Ok(());
+    }
 
     if let Some(("magnet", matches)) = matches.subcommand() {
         let link = matches.get_one::<String>("link").cloned();
         let txt = matches.get_one::<PathBuf>("txt").cloned();
         let cid = matches.get_one::<String>("cid").cloned();
-        let mut magnets: Vec<String> = Vec::new();
-        if txt.is_some() {
-            magnets = get_magnet_list_by_txt(&txt.unwrap())?;
-        } else if link.is_some() {
-            magnets.push(link.unwrap());
+        let savepath = matches.get_one::<String>("savepath").cloned();
+
+        let mut magnets = Vec::new();
+        if let Some(path) = txt {
+            magnets = get_magnet_list_by_txt(&path)?;
+        } else if let Some(link) = link {
+            magnets.push(link);
         } else {
             eprintln!("magnet link or txt file is required");
             std::process::exit(1);
         }
-        if let Err(err) = execute_magnets_task(&magnets, cid).await {
-            eprintln!("{}", err);
+
+        if let Err(err) = runner.execute_links(&magnets, cid, savepath).await {
+            eprintln!("{err}");
             std::process::exit(1);
         }
         return Ok(());
     }
 
-    let service = RssService::new();
-
-    let url = matches.get_one::<String>("url");
-    if url.is_some() {
-        if let Err(err) = execute_url_task(&service, &url.unwrap()).await {
-            eprintln!("{}", err);
+    let service = RssService::new()?;
+    if let Some(url) = matches.get_one::<String>("url") {
+        if let Err(err) = runner.execute_url(&service, url).await {
+            eprintln!("{err}");
             std::process::exit(1);
         }
         return Ok(());
     }
-    if matches.get_one::<bool>("concurrent").copied() == Some(true) {
-        if let Err(err) = execute_tasks(&service).await {
-            eprintln!("{}", err);
-            std::process::exit(1);
-        }
+
+    let result = if matches.get_one::<bool>("concurrent").copied() == Some(true) {
+        runner.execute_all_concurrent(&service).await
     } else {
-        if let Err(err) = execute_all_rss_task(&service).await {
-            eprintln!("{}", err);
-            std::process::exit(1);
-        }
+        runner.execute_all(&service).await
+    };
+    if let Err(err) = result {
+        eprintln!("{err}");
+        std::process::exit(1);
     }
 
     Ok(())

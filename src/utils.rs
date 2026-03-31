@@ -11,6 +11,7 @@ pub fn get_magnet_list_by_txt(txt: &PathBuf) -> anyhow::Result<Vec<String>> {
     for line in reader.lines() {
         let line = line?;
         if line.starts_with("magnet:")
+            || line.starts_with("ed2k://")
             || line.starts_with("https://")
             || line.starts_with("http://")
             || line.starts_with("ftp://")

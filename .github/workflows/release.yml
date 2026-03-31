@@ -1,27 +1,50 @@
 name: Publish Release
+
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
   packages: write
 
 jobs:
-  release:
+  validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+  release:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
           body_path: ./CHANGELOG.md
+
   upload-assets:
+    needs:
+      - validate
+      - release
     strategy:
       matrix:
         include:
@@ -29,18 +52,18 @@ jobs:
             os: ubuntu-latest
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-          - target: x86_64-pc-windows-gnu
+          - target: x86_64-pc-windows-msvc
             os: windows-latest
           - target: x86_64-apple-darwin
             os: macos-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: rss2pan
           target: ${{ matrix.target }}
           tar: unix
           zip: windows
-          # checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,22 +1,49 @@
 use std::path::PathBuf;
 
-use clap::{arg, crate_version, ArgAction, Command};
+use clap::{arg, crate_version, value_parser, Arg, ArgAction, Command};
 
 pub fn build_app() -> Command {
     let app = Command::new("rss2pan")
         .version(crate_version!())
         .about("rss to pan")
-        .arg(arg!(-r --rss [rss] "rss.json path").value_parser(clap::value_parser!(PathBuf)))
+        .arg(arg!(-r --rss [rss] "rss.json path").value_parser(value_parser!(PathBuf)))
         .arg(arg!(-u --url [url] "rss url"))
         .arg(arg!(-m --concurrent "concurrent request").action(ArgAction::SetTrue))
+        .arg(arg!(--cookies [cookies] "115 cookies"))
+        .arg(arg!(--"no-cache" "skip checking cache in db.sqlite").action(ArgAction::SetTrue))
+        .arg(
+            arg!(--"chunk-delay" [chunk_delay] "chunk delay in seconds")
+                .value_parser(value_parser!(u64)),
+        )
+        .arg(
+            arg!(--"chunk-size" [chunk_size] "chunk size for offline tasks")
+                .value_parser(value_parser!(usize)),
+        )
+        .arg(
+            arg!(--"clear-task-type" [clear_task_type] "clear offline task type: 1-6")
+                .value_parser(value_parser!(u8).range(1..=6)),
+        )
         .subcommand(
             Command::new("magnet")
                 .about("magnet to pan")
                 .arg(arg!(-l --link [link] "magnet link").conflicts_with("txt"))
-                .arg(arg!(--txt [txt] "magnet txt file")
-                    .value_parser(clap::value_parser!(PathBuf))
-                    .conflicts_with("link"))
+                .arg(
+                    Arg::new("txt")
+                        .long("txt")
+                        .visible_alias("text")
+                        .help("magnet txt file")
+                        .value_parser(value_parser!(PathBuf))
+                        .conflicts_with("link"),
+                )
                 .arg(arg!(--cid [cid] "folder id in wangpan"))
+                .arg(arg!(--savepath [savepath] "save path under cid/root")),
+        )
+        .subcommand(
+            Command::new("server").about("start server").arg(
+                arg!(-p --port [port] "server port")
+                    .value_parser(value_parser!(u16))
+                    .default_value("8115"),
+            ),
         );
 
     app
@@ -71,4 +98,31 @@ fn t_subcomd() {
         }
         _ => panic!("subcommand not found"),
     }
+}
+
+#[test]
+fn t_new_flags() {
+    let cmd = build_app();
+    let matches = cmd
+        .try_get_matches_from([
+            "rss2pan",
+            "--cookies",
+            "UID=1;CID=2;SEID=3",
+            "--no-cache",
+            "--chunk-delay",
+            "3",
+            "--chunk-size",
+            "50",
+            "--clear-task-type",
+            "2",
+        ])
+        .unwrap();
+    assert_eq!(
+        matches.get_one::<String>("cookies").map(|s| s.as_str()),
+        Some("UID=1;CID=2;SEID=3")
+    );
+    assert_eq!(matches.get_one::<bool>("no-cache").copied(), Some(true));
+    assert_eq!(matches.get_one::<u64>("chunk-delay").copied(), Some(3));
+    assert_eq!(matches.get_one::<usize>("chunk-size").copied(), Some(50));
+    assert_eq!(matches.get_one::<u8>("clear-task-type").copied(), Some(2));
 }

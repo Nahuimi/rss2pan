@@ -1,29 +1,30 @@
 use chrono::prelude::*;
 
-use anyhow::Result;
-use rusqlite::{Connection, Error};
+use anyhow::{bail, Result};
+use rusqlite::{params, Connection, Error};
+use url::Url;
 
 use crate::rss_site::MagnetItem;
 
 pub struct RssService {
-    conn: Box<Connection>,
+    conn: Connection,
 }
 
 impl RssService {
     // pub fn new<P: AsRef<Path>>(path: P) -> Self {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self> {
         let path = "db.sqlite";
-        let conn = Box::new(Connection::open(path).expect("invalid db path"));
+        let conn = Connection::open(path)?;
         conn.execute(
-            "CREATE TABLE if not exists `rss_items` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `link` VARCHAR(255), `title` VARCHAR(255), `guid` VARCHAR(255), `pubDate` DATETIME, `creator` VARCHAR(255), `summary` TEXT, `content` VARCHAR(255), `isoDate` DATETIME, `categories` VARCHAR(255), `contentSnippet` VARCHAR(255), `done` TINYINT(1) DEFAULT 0, `magnet` VARCHAR(255) NOT NULL, `createdAt` DATETIME NOT NULL, `updatedAt` DATETIME NOT NULL)",
+            "CREATE TABLE if not exists `rss_items` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `link` VARCHAR(255), `title` VARCHAR(255), `guid` VARCHAR(255), `pubDate` DATETIME, `creator` VARCHAR(255), `summary` TEXT, `content` VARCHAR(255), `isoDate` DATETIME, `categories` VARCHAR(255), `contentSnippet` VARCHAR(255), `done` TINYINT(1) DEFAULT 0, `magnet` TEXT NOT NULL, `createdAt` DATETIME NOT NULL, `updatedAt` DATETIME NOT NULL)",
             (), // empty list of parameters.
-        ).unwrap();
+        )?;
         conn.execute(
             "CREATE TABLE if not exists `sites_status` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `name` VARCHAR(255), `needLogin` TINYINT(1), `abnormalOp` TINYINT(1), `createdAt` DATETIME NOT NULL, `updatedAt` DATETIME NOT NULL)",
             (), // empty list of parameters.
-        ).unwrap();
+        )?;
         // let conn = Box::new(Connection::open_in_memory().expect("invalid db path"));
-        Self { conn }
+        Ok(Self { conn })
     }
     pub fn save_items(&self, items: &[MagnetItem], done: bool) -> Result<()> {
         let now: DateTime<Utc> = Utc::now();
@@ -42,16 +43,16 @@ impl RssService {
         }
         Ok(())
     }
-    pub fn has_item(&self, magnet: &str) -> bool {
-        let (item,) = self
-            .conn
-            .query_row(
-                "SELECT count(*) AS num FROM rss_items WHERE magnet = ?1",
-                [magnet],
-                |row| <(u8,)>::try_from(row),
-            )
-            .unwrap();
-        item > 0
+    pub fn has_item(&self, magnet: &str) -> Result<bool> {
+        let like_pattern = extract_xt(magnet)
+            .map(|xt| format!("%{xt}%"))
+            .unwrap_or_default();
+        let item: i64 = self.conn.query_row(
+            "SELECT count(*) AS num FROM rss_items WHERE magnet = ?1 OR magnet LIKE ?2",
+            [magnet, like_pattern.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(item > 0)
     }
     #[allow(dead_code)]
     pub fn get_item_by_magnet(&self, magnet: &str) -> Result<MagnetItem> {
@@ -74,42 +75,51 @@ impl RssService {
     // @TODO 网站状态
     #[allow(dead_code)]
     pub fn update_status(&self, host: &str, key: &str, value: bool) -> Result<usize> {
-        let value: u8 = value.into();
-        let value = value.to_string();
-        let stmt = format!("UPDATE sites_status SET {key} = {value} WHERE name = \"{host}\"");
-        let num = self.conn.execute(&stmt, [])?;
+        let column = match key {
+            "needLogin" => "needLogin",
+            "abnormalOp" => "abnormalOp",
+            _ => bail!("invalid status column: {key}"),
+        };
+        let stmt = format!("UPDATE sites_status SET {column} = ?1 WHERE name = ?2");
+        let num = self.conn.execute(&stmt, params![u8::from(value), host])?;
         Ok(num)
     }
     #[allow(dead_code)]
     pub fn reset_status(&self, name: &str) -> Result<usize> {
-        let stmt =
-            format!("UPDATE sites_status SET abnormalOp = 0,needLogin = 0 WHERE name = \"{name}\"");
-        let num = self.conn.execute(&stmt, [])?;
+        let num = self.conn.execute(
+            "UPDATE sites_status SET abnormalOp = 0,needLogin = 0 WHERE name = ?1",
+            [name],
+        )?;
         Ok(num)
     }
     #[allow(dead_code)]
-    pub fn is_ready(&self, name: &str) -> bool {
+    pub fn is_ready(&self, name: &str) -> Result<bool> {
         let r = self.conn.query_row(
             "SELECT needLogin,abnormalOp FROM sites_status WHERE name = ?1",
             [name],
             |row| <(u8, u8)>::try_from(row),
         );
         match r {
-            Ok((0, 0)) => true,
-            Ok(_) => false,
+            Ok((0, 0)) => Ok(true),
+            Ok(_) => Ok(false),
             Err(Error::QueryReturnedNoRows) => {
                 let now: DateTime<Utc> = Utc::now();
-                self.conn
-                    .execute(
-                        "INSERT INTO sites_status (name,`createdAt`,`updatedAt`,`needLogin`, `abnormalOp`) VALUES (?,?,?,0,0)",
-                        [name, &now.to_string(), &now.to_string()],
-                    )
-                    .unwrap();
-                true
+                self.conn.execute(
+                    "INSERT INTO sites_status (name,`createdAt`,`updatedAt`,`needLogin`, `abnormalOp`) VALUES (?,?,?,0,0)",
+                    [name, &now.to_string(), &now.to_string()],
+                )?;
+                Ok(true)
             }
-            Err(err) => panic!("{:?}", err),
+            Err(err) => Err(err.into()),
         }
     }
+}
+
+fn extract_xt(magnet: &str) -> Option<String> {
+    Url::parse(magnet).ok().and_then(|url| {
+        url.query_pairs()
+            .find_map(|(key, value)| (key == "xt").then(|| value.into_owned()))
+    })
 }
 
 #[cfg(test)]
@@ -125,7 +135,7 @@ mod tests {
     }
     #[test]
     fn get_item_test() {
-        let service = RssService::new();
+        let service = RssService::new().unwrap();
         let r = service.get_item_by_magnet("magnet");
         assert!(r.is_err());
     }
@@ -134,15 +144,23 @@ mod tests {
         let host = "115.com";
         let key = "abnormalOp";
         let value = false;
-        let service = RssService::new();
+        let service = RssService::new().unwrap();
         let r = service.update_status(host, key, value);
         println!("{:?}", r);
     }
     #[test]
     fn is_ready_test() {
         let host = "114.com";
-        let service = RssService::new();
-        let r = service.is_ready(host);
+        let service = RssService::new().unwrap();
+        let r = service.is_ready(host).unwrap();
         assert!(r);
+    }
+
+    #[test]
+    fn test_extract_xt() {
+        assert_eq!(
+            extract_xt("magnet:?xt=urn:btih:12345&dn=test"),
+            Some("urn:btih:12345".to_string())
+        );
     }
 }

@@ -1,8 +1,8 @@
-mod xor;
 mod rsa;
+mod xor;
 
+use base64::{engine::general_purpose, Engine as _};
 use rand::Rng;
-use base64::{Engine as _, engine::general_purpose};
 
 use xor::*;
 

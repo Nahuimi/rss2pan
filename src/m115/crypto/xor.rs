@@ -12,14 +12,13 @@ pub const XOR_SEED: [u8; 144] = [
 ];
 
 pub const XOR_CLIENT_KEY: [u8; 12] = [
-    0x78, 0x06, 0xad, 0x4c, 0x33, 0x86, 0x5d, 0x18,
-    0x4c, 0x01, 0x3f, 0x46,
+    0x78, 0x06, 0xad, 0x4c, 0x33, 0x86, 0x5d, 0x18, 0x4c, 0x01, 0x3f, 0x46,
 ];
 
 pub fn xor_derive_key(seed: &[u8], size: usize) -> Vec<u8> {
     let mut key = vec![0; size];
     for i in 0..size {
-        key[i] = (seed[i].wrapping_add( XOR_SEED[size * i])) & 0xff;
+        key[i] = seed[i].wrapping_add(XOR_SEED[size * i]);
         key[i] ^= XOR_SEED[size * (size - i - 1)];
     }
     key
