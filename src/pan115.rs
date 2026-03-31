@@ -100,9 +100,17 @@ impl Pan115Client {
             .header(reqwest::header::USER_AGENT, UA_115_BROWSER))
     }
 
-    async fn request_json(&self, request: RequestBuilder) -> Result<Value> {
-        let response = request.send().await?.error_for_status()?;
-        Ok(response.json().await?)
+    async fn request_json(&self, request: RequestBuilder, endpoint: &str) -> Result<Value> {
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("request 115 api failed: {endpoint}"))?
+            .error_for_status()
+            .with_context(|| format!("115 api returned non-success status: {endpoint}"))?;
+        response
+            .json()
+            .await
+            .with_context(|| format!("decode 115 api response failed: {endpoint}"))
     }
 
     pub async fn ensure_logged_in(&self) -> Result<()> {
@@ -118,6 +126,7 @@ impl Pan115Client {
             .request_json(
                 self.req(Method::GET, API_STATUS_CHECK)?
                     .query(&[("_", now_millis().to_string())]),
+                API_STATUS_CHECK,
             )
             .await?;
         Ok(value.get("state").and_then(json_bool).unwrap_or(false))
@@ -132,6 +141,7 @@ impl Pan115Client {
             .request_json(
                 self.req(Method::GET, API_USER_INFO)?
                     .query(&[("_", now_secs().to_string())]),
+                API_USER_INFO,
             )
             .await?;
         ensure_success(&value)?;
@@ -149,6 +159,7 @@ impl Pan115Client {
             .request_json(
                 self.req(Method::POST, API_CLEAR_OFFLINE_URL)?
                     .form(&[("flag", flag.to_string())]),
+                API_CLEAR_OFFLINE_URL,
             )
             .await?;
         ensure_success(&value)?;
@@ -184,6 +195,7 @@ impl Pan115Client {
                 self.req(Method::POST, API_ADD_OFFLINE_URL)?
                     .query(&[("t", now_secs().to_string())])
                     .form(&[("data", encoded)]),
+                API_ADD_OFFLINE_URL,
             )
             .await?;
         ensure_success(&value)?;
@@ -276,20 +288,23 @@ impl Pan115Client {
 
     async fn list_dir(&self, parent_id: &str, offset: i64, limit: i64) -> Result<Value> {
         let value = self
-            .request_json(self.req(Method::GET, API_FILE_LIST)?.query(&[
-                ("aid", "1".to_string()),
-                ("cid", parent_id.to_string()),
-                ("o", "file_name".to_string()),
-                ("asc", "1".to_string()),
-                ("offset", offset.to_string()),
-                ("show_dir", "1".to_string()),
-                ("limit", limit.to_string()),
-                ("snap", "0".to_string()),
-                ("natsort", "0".to_string()),
-                ("record_open_time", "1".to_string()),
-                ("format", "json".to_string()),
-                ("fc_mix", "0".to_string()),
-            ]))
+            .request_json(
+                self.req(Method::GET, API_FILE_LIST)?.query(&[
+                    ("aid", "1".to_string()),
+                    ("cid", parent_id.to_string()),
+                    ("o", "file_name".to_string()),
+                    ("asc", "1".to_string()),
+                    ("offset", offset.to_string()),
+                    ("show_dir", "1".to_string()),
+                    ("limit", limit.to_string()),
+                    ("snap", "0".to_string()),
+                    ("natsort", "0".to_string()),
+                    ("record_open_time", "1".to_string()),
+                    ("format", "json".to_string()),
+                    ("fc_mix", "0".to_string()),
+                ]),
+                API_FILE_LIST,
+            )
             .await?;
         ensure_success(&value)?;
         Ok(value)
@@ -300,6 +315,7 @@ impl Pan115Client {
             .request_json(
                 self.req(Method::POST, API_DIR_ADD)?
                     .form(&[("pid", parent_id.to_string()), ("cname", name.to_string())]),
+                API_DIR_ADD,
             )
             .await?;
         match ensure_success(&value) {
