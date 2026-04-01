@@ -3,6 +3,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -61,7 +62,7 @@ pub struct Ajax {
     inner_client_proxy: Option<reqwest::Client>,
     proxy_client_error: Option<String>,
     site_config: NodeSiteConfig,
-    cookie_override: Option<String>,
+    cookie_override: Arc<Mutex<Option<String>>>,
 }
 
 fn get_site_config(filename: Option<PathBuf>) -> NodeSiteConfig {
@@ -99,7 +100,7 @@ impl Ajax {
             inner_client_proxy,
             proxy_client_error,
             site_config: get_site_config(None),
-            cookie_override,
+            cookie_override: Arc::new(Mutex::new(cookie_override)),
         }
     }
 
@@ -114,11 +115,9 @@ impl Ajax {
                 .cloned()
                 .or_else(|| cur.headers.get("Cookie").cloned())
         });
+        let cookie_override = self.cookie_override.lock().unwrap().clone();
         if host.contains("115.com") {
-            self.cookie_override
-                .clone()
-                .or(config_cookie)
-                .or_else(load_cookie_file)
+            cookie_override.or(config_cookie).or_else(load_cookie_file)
         } else {
             config_cookie
         }
@@ -127,6 +126,18 @@ impl Ajax {
     pub fn cookie_for_host(&self, host: &str) -> Option<String> {
         let config = self.site_config.get(host);
         self.resolved_cookie(host, config)
+    }
+
+    pub fn set_cookie_for_host(&self, host: &str, cookie: Option<String>) {
+        if host.contains("115.com") {
+            *self.cookie_override.lock().unwrap() = cookie
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+        }
+    }
+
+    pub fn save_cookie_file(&self, cookie: &str) -> Result<()> {
+        fs::write(".cookies", format!("{}\n", cookie.trim())).context("write .cookies failed")
     }
 
     fn build_headers(&self, host: &str) -> HeaderMap {
@@ -181,5 +192,29 @@ impl Ajax {
         } else {
             Ok(self.inner_client.request(method, url).headers(headers))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Ajax;
+
+    #[test]
+    fn test_cookie_override_can_be_updated() {
+        let ajax = Ajax::new(None);
+        assert_eq!(ajax.cookie_for_host("115.com"), None);
+
+        ajax.set_cookie_for_host("115.com", Some("UID=1; CID=2; SEID=3".to_string()));
+        assert_eq!(
+            ajax.cookie_for_host("115.com").as_deref(),
+            Some("UID=1; CID=2; SEID=3")
+        );
+
+        let cloned = ajax.clone();
+        cloned.set_cookie_for_host("115.com", Some("UID=4; CID=5; SEID=6".to_string()));
+        assert_eq!(
+            ajax.cookie_for_host("115.com").as_deref(),
+            Some("UID=4; CID=5; SEID=6")
+        );
     }
 }

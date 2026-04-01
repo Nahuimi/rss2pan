@@ -33,6 +33,9 @@ async fn main() -> anyhow::Result<()> {
         rss_path,
         RunOptions::from_matches(&matches),
     );
+    if let Some(qrcode_app) = forced_qrcode_app(&matches) {
+        pan115.login_with_qrcode(qrcode_app).await?;
+    }
 
     if let Some(clear_task_type) = matches.get_one::<u8>("clear-task-type").copied() {
         pan115.ensure_logged_in().await?;
@@ -114,4 +117,46 @@ fn init_logger() {
         )
     });
     builder.init();
+}
+
+fn forced_qrcode_app(matches: &clap::ArgMatches) -> Option<&str> {
+    matches
+        .get_one::<bool>("qrcode")
+        .copied()
+        .filter(|enabled| *enabled)
+        .map(|_| {
+            matches
+                .get_one::<String>("qrcode-app")
+                .map(|value| value.as_str())
+                .unwrap_or("tv")
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::build_app;
+
+    #[test]
+    fn test_forced_qrcode_app_is_selected_even_with_cookies() {
+        let matches = build_app()
+            .try_get_matches_from([
+                "rss2pan",
+                "--cookies",
+                "UID=1;CID=2;SEID=3",
+                "--qrcode",
+                "--qrcode-app",
+                "ios",
+            ])
+            .unwrap();
+        assert_eq!(forced_qrcode_app(&matches), Some("ios"));
+    }
+
+    #[test]
+    fn test_forced_qrcode_app_is_absent_without_flag() {
+        let matches = build_app()
+            .try_get_matches_from(["rss2pan", "--cookies", "UID=1;CID=2;SEID=3"])
+            .unwrap();
+        assert_eq!(forced_qrcode_app(&matches), None);
+    }
 }

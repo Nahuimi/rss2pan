@@ -55,7 +55,7 @@ async fn handle_add_task(
     .await
     {
         Ok(()) => (StatusCode::OK, "message success").into_response(),
-        Err(err) => (StatusCode::BAD_GATEWAY, err.to_string()).into_response(),
+        Err(err) => (add_task_error_status(&err), err.to_string()).into_response(),
     }
 }
 
@@ -78,6 +78,7 @@ async fn submit_links(
                 }
                 Some(Pan115ErrorKind::InvalidLink) => {
                     log::warn!("[server] wrong links");
+                    return Err(err);
                 }
                 _ => return Err(err),
             },
@@ -93,6 +94,13 @@ fn add_error_kind(err: &anyhow::Error) -> Option<Pan115ErrorKind> {
     err.downcast_ref::<Pan115Error>().map(Pan115Error::kind)
 }
 
+fn add_task_error_status(err: &anyhow::Error) -> StatusCode {
+    match add_error_kind(err) {
+        Some(Pan115ErrorKind::InvalidLink) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::BAD_GATEWAY,
+    }
+}
+
 fn chunk_count(len: usize, size: usize) -> usize {
     if len == 0 {
         0
@@ -103,4 +111,21 @@ fn chunk_count(len: usize, size: usize) -> usize {
 
 async fn shutdown_signal() {
     let _ = signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_invalid_link_maps_to_bad_request() {
+        let err: anyhow::Error = Pan115Error::new(10004, None).into();
+        assert_eq!(add_task_error_status(&err), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_unexpected_error_maps_to_bad_gateway() {
+        let err: anyhow::Error = Pan115Error::new(99999, None).into();
+        assert_eq!(add_task_error_status(&err), StatusCode::BAD_GATEWAY);
+    }
 }

@@ -144,14 +144,15 @@ impl TaskRunner {
                 Ok(_) => {
                     log::info!("{label} add {} tasks", chunk.len());
                 }
-                Err(err) => match add_error_kind(&err) {
-                    Some(Pan115ErrorKind::TaskExisted) => {
+                Err(err) => match classify_add_error(&err) {
+                    AddErrorAction::IgnoreTaskExisted => {
                         log::warn!("{label} task exist");
                     }
-                    Some(Pan115ErrorKind::InvalidLink) => {
+                    AddErrorAction::FailInvalidLink => {
                         log::warn!("{label} wrong links");
+                        return Err(err);
                     }
-                    _ => return Err(err),
+                    AddErrorAction::Fail => return Err(err),
                 },
             }
             if index + 1 < chunk_count(links.len(), self.options.chunk_size) {
@@ -207,15 +208,16 @@ impl TaskRunner {
                     );
                     service.save_items(chunk, true)?;
                 }
-                Err(err) => match add_error_kind(&err) {
-                    Some(Pan115ErrorKind::TaskExisted) => {
+                Err(err) => match classify_add_error(&err) {
+                    AddErrorAction::IgnoreTaskExisted => {
                         log::warn!("[{}] task exist", config.name_or_url());
                         service.save_items(chunk, true)?;
                     }
-                    Some(Pan115ErrorKind::InvalidLink) => {
+                    AddErrorAction::FailInvalidLink => {
                         log::warn!("[{}] wrong links", config.name_or_url());
+                        return Err(err);
                     }
-                    _ => return Err(err),
+                    AddErrorAction::Fail => return Err(err),
                 },
             }
             if index + 1 < chunk_count(tasks.len(), self.options.chunk_size) {
@@ -229,6 +231,21 @@ impl TaskRunner {
 
 fn add_error_kind(err: &anyhow::Error) -> Option<Pan115ErrorKind> {
     err.downcast_ref::<Pan115Error>().map(Pan115Error::kind)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddErrorAction {
+    IgnoreTaskExisted,
+    FailInvalidLink,
+    Fail,
+}
+
+fn classify_add_error(err: &anyhow::Error) -> AddErrorAction {
+    match add_error_kind(err) {
+        Some(Pan115ErrorKind::TaskExisted) => AddErrorAction::IgnoreTaskExisted,
+        Some(Pan115ErrorKind::InvalidLink) => AddErrorAction::FailInvalidLink,
+        _ => AddErrorAction::Fail,
+    }
 }
 
 fn chunk_count(len: usize, size: usize) -> usize {
@@ -250,5 +267,22 @@ impl RssConfigExt for RssConfig {
         } else {
             &self.name
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_add_error_ignores_task_existed() {
+        let err: anyhow::Error = Pan115Error::new(10008, None).into();
+        assert_eq!(classify_add_error(&err), AddErrorAction::IgnoreTaskExisted);
+    }
+
+    #[test]
+    fn test_classify_add_error_rejects_invalid_link() {
+        let err: anyhow::Error = Pan115Error::new(10004, None).into();
+        assert_eq!(classify_add_error(&err), AddErrorAction::FailInvalidLink);
     }
 }

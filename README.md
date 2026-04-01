@@ -17,6 +17,8 @@
 - [x] `/add` HTTP API
 - [x] `savepath` 支持
 - [x] `--cookies`
+- [x] `-q --qrcode`
+- [x] `--qrcode-app`
 - [x] `--no-cache`
 - [x] `--clear-task-type`
 - [x] `--chunk-delay`
@@ -54,6 +56,12 @@ rss2pan
 rss2pan -m
 # 使用 cookies
 rss2pan --cookies "UID=xxx;CID=xxx;SEID=xxx;KID=xxx"
+# 使用二维码登录。成功后会写入 .cookies
+rss2pan -q
+# 指定二维码登录端
+rss2pan -q --qrcode-app android
+rss2pan -q --qrcode-app ios
+rss2pan -q --qrcode-app 115android
 # 跳过 db.sqlite 缓存检查
 rss2pan --no-cache
 # 调整分块大小和间隔
@@ -80,6 +88,21 @@ curl -H "Content-Type: application/json" -d "{\"tasks\":[\"magnet:?xt=urn:btih:x
 ### 注意
 
 日志报 `115 abnormal operation` 时，说明账号触发了异常验证，需要在浏览器端手动离线，输入验证码后解除。
+
+#### 二维码登录端
+
+`--qrcode-app` 默认是 `tv`
+
+- `web`: 网页版
+- `android`: 115生活(Android端)
+- `115android`: 115(Android端)
+- `ios`: 115生活(iOS端)
+- `115ipad`: 115(iPad端)
+- `tv`: 115网盘(Android电视端)
+- `alipaymini`: 115生活(支付宝小程序)
+- `wechatmini`: 115生活(微信小程序)
+- `qandroid`: 115管理(Android端)
+- `115ios`: 115(iOS端)
 
 ## 配置
 

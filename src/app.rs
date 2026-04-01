@@ -1,6 +1,20 @@
 use std::path::PathBuf;
 
+use clap::builder::PossibleValuesParser;
 use clap::{arg, crate_version, value_parser, Arg, ArgAction, Command};
+
+const QRCODE_APPS: &[&str] = &[
+    "web",
+    "android",
+    "115android",
+    "ios",
+    "115ipad",
+    "tv",
+    "alipaymini",
+    "wechatmini",
+    "qandroid",
+    "115ios",
+];
 
 pub fn build_app() -> Command {
     let app = Command::new("rss2pan")
@@ -10,6 +24,15 @@ pub fn build_app() -> Command {
         .arg(arg!(-u --url [url] "rss url"))
         .arg(arg!(-m --concurrent "concurrent request").action(ArgAction::SetTrue))
         .arg(arg!(--cookies [cookies] "115 cookies"))
+        .arg(arg!(-q --qrcode "login 115 by qrcode").action(ArgAction::SetTrue))
+        .arg(
+            Arg::new("qrcode-app")
+                .long("qrcode-app")
+                .help("qrcode login app")
+                .default_value("tv")
+                .requires("qrcode")
+                .value_parser(PossibleValuesParser::new(QRCODE_APPS)),
+        )
         .arg(arg!(--"no-cache" "skip checking cache in db.sqlite").action(ArgAction::SetTrue))
         .arg(
             arg!(--"chunk-delay" [chunk_delay] "chunk delay in seconds")
@@ -108,6 +131,9 @@ fn t_new_flags() {
             "rss2pan",
             "--cookies",
             "UID=1;CID=2;SEID=3",
+            "--qrcode",
+            "--qrcode-app",
+            "ios",
             "--no-cache",
             "--chunk-delay",
             "3",
@@ -120,6 +146,11 @@ fn t_new_flags() {
     assert_eq!(
         matches.get_one::<String>("cookies").map(|s| s.as_str()),
         Some("UID=1;CID=2;SEID=3")
+    );
+    assert_eq!(matches.get_one::<bool>("qrcode").copied(), Some(true));
+    assert_eq!(
+        matches.get_one::<String>("qrcode-app").map(|s| s.as_str()),
+        Some("ios")
     );
     assert_eq!(matches.get_one::<bool>("no-cache").copied(), Some(true));
     assert_eq!(matches.get_one::<u64>("chunk-delay").copied(), Some(3));
