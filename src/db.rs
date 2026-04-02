@@ -224,7 +224,9 @@ impl RssService {
 }
 
 fn repeat_vars(count: usize) -> String {
-    std::iter::repeat_n("?", count).collect::<Vec<_>>().join(",")
+    std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]
@@ -283,13 +285,13 @@ mod tests {
     fn test_existing_magnets_returns_matches() {
         let mut service = RssService::new_in_memory().unwrap();
         service
-            .save_items(&[magnet_item(&magnet("abc")), magnet_item(&magnet("def"))], true)
+            .save_items(
+                &[magnet_item(&magnet("abc")), magnet_item(&magnet("def"))],
+                true,
+            )
             .unwrap();
         let existing = service
-            .existing_magnets(&[
-                "magnet:?xt=URN:BTIH:ABC&dn=test".to_string(),
-                magnet("xyz"),
-            ])
+            .existing_magnets(&["magnet:?xt=URN:BTIH:ABC&dn=test".to_string(), magnet("xyz")])
             .unwrap();
         assert_eq!(existing, HashSet::from([magnet("abc")]));
     }

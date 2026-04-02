@@ -40,8 +40,7 @@ fn canonicalize_btih_xt(xt: &str) -> Option<String> {
     let urn = parts.next()?;
     let kind = parts.next()?;
     let hash = parts.next()?.trim();
-    if !urn.eq_ignore_ascii_case("urn") || !kind.eq_ignore_ascii_case("btih") || hash.is_empty()
-    {
+    if !urn.eq_ignore_ascii_case("urn") || !kind.eq_ignore_ascii_case("btih") || hash.is_empty() {
         return None;
     }
     Some(format!("urn:btih:{}", hash.to_ascii_lowercase()))

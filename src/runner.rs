@@ -147,7 +147,11 @@ impl TaskRunner {
         let (deduped, empty_num) = dedup_task_items(item_list);
 
         if empty_num > 0 {
-            log::warn!("[{}] has {} empty tasks", config_name_or_url(config), empty_num);
+            log::warn!(
+                "[{}] has {} empty tasks",
+                config_name_or_url(config),
+                empty_num
+            );
         }
 
         if deduped.is_empty() {

@@ -60,7 +60,6 @@ async fn handle_add_task(
     }
 }
 
-
 fn add_task_error_status(err: &anyhow::Error) -> StatusCode {
     match submit_error_kind(err) {
         Some(Pan115ErrorKind::InvalidLink) => StatusCode::BAD_REQUEST,
