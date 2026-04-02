@@ -17,7 +17,7 @@ pub use mikanani::*;
 pub use nyaa::*;
 pub use rsshub::*;
 
-use crate::{request::Ajax, rss_config::RssConfig};
+use crate::{request::Ajax, rss_config::RssConfig, utils::canonicalize_magnet};
 
 pub trait MagnetSite {
     fn get_magnet(&self, item: &Item) -> Option<String>;
@@ -26,7 +26,7 @@ pub trait MagnetSite {
         Some(MagnetItem {
             title: item.title().map_or_else(String::new, |s| s.to_string()),
             link: item.link().map_or_else(String::new, |s| s.to_string()),
-            magnet: self.get_magnet(item)?,
+            magnet: canonicalize_magnet(&self.get_magnet(item)?),
             description: item.description().map(|s| s.to_string()),
             content: item.content().map(|s| s.to_string()),
         })
@@ -161,7 +161,7 @@ mod tests {
         assert!(channel.is_ok());
         let channel = channel.unwrap();
 
-        let service = RssService::new().unwrap();
+        let mut service = RssService::new_in_memory().unwrap();
         let site = get_site("mikanani.me").unwrap();
         let items: Vec<MagnetItem> = channel
             .items()

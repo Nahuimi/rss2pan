@@ -1,11 +1,11 @@
 use anyhow::Result;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use serde::Deserialize;
-use tokio::{net::TcpListener, signal, time::sleep};
+use tokio::{net::TcpListener, signal};
 
 use crate::{
-    pan115::{Pan115Client, Pan115Error, Pan115ErrorKind},
-    runner::RunOptions,
+    pan115::{Pan115Client, Pan115ErrorKind},
+    runner::{submit_error_kind, submit_links_with_options, RunOptions},
 };
 
 #[derive(Clone)]
@@ -45,9 +45,10 @@ async fn handle_add_task(
     if let Err(err) = state.pan115.ensure_logged_in().await {
         return (StatusCode::UNAUTHORIZED, err.to_string()).into_response();
     }
-    match submit_links(
+    match submit_links_with_options(
         &state.pan115,
         state.options,
+        "[server]",
         &task.tasks,
         task.cid.as_deref(),
         task.savepath.as_deref(),
@@ -59,53 +60,11 @@ async fn handle_add_task(
     }
 }
 
-async fn submit_links(
-    pan115: &Pan115Client,
-    options: RunOptions,
-    links: &[String],
-    cid: Option<&str>,
-    savepath: Option<&str>,
-) -> Result<()> {
-    for (index, chunk) in links.chunks(options.chunk_size).enumerate() {
-        let chunk_links = chunk.to_vec();
-        match pan115.add_offline_urls(&chunk_links, cid, savepath).await {
-            Ok(_) => {
-                log::info!("[server] add {} tasks", chunk.len());
-            }
-            Err(err) => match add_error_kind(&err) {
-                Some(Pan115ErrorKind::TaskExisted) => {
-                    log::warn!("[server] task exist");
-                }
-                Some(Pan115ErrorKind::InvalidLink) => {
-                    log::warn!("[server] wrong links");
-                    return Err(err);
-                }
-                _ => return Err(err),
-            },
-        }
-        if index + 1 < chunk_count(links.len(), options.chunk_size) {
-            sleep(options.chunk_delay).await;
-        }
-    }
-    Ok(())
-}
-
-fn add_error_kind(err: &anyhow::Error) -> Option<Pan115ErrorKind> {
-    err.downcast_ref::<Pan115Error>().map(Pan115Error::kind)
-}
 
 fn add_task_error_status(err: &anyhow::Error) -> StatusCode {
-    match add_error_kind(err) {
+    match submit_error_kind(err) {
         Some(Pan115ErrorKind::InvalidLink) => StatusCode::BAD_REQUEST,
         _ => StatusCode::BAD_GATEWAY,
-    }
-}
-
-fn chunk_count(len: usize, size: usize) -> usize {
-    if len == 0 {
-        0
-    } else {
-        (len - 1) / size + 1
     }
 }
 
@@ -116,6 +75,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pan115::Pan115Error;
 
     #[test]
     fn test_invalid_link_maps_to_bad_request() {

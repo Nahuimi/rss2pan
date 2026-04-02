@@ -73,9 +73,9 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let service = RssService::new()?;
+    let mut service = RssService::new()?;
     if let Some(url) = matches.get_one::<String>("url") {
-        if let Err(err) = runner.execute_url(&service, url).await {
+        if let Err(err) = runner.execute_url(&mut service, url).await {
             print_error(&err);
             std::process::exit(1);
         }
@@ -83,9 +83,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let result = if matches.get_one::<bool>("concurrent").copied() == Some(true) {
-        runner.execute_all_concurrent(&service).await
+        runner.execute_all_concurrent(&mut service).await
     } else {
-        runner.execute_all(&service).await
+        runner.execute_all(&mut service).await
     };
     if let Err(err) = result {
         print_error(&err);
