@@ -2,7 +2,7 @@ use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use clap::ArgMatches;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{stream, StreamExt};
 use tokio::time::sleep;
 
 use crate::{
@@ -10,7 +10,7 @@ use crate::{
     pan115::{Pan115Client, Pan115Error, Pan115ErrorKind},
     request::Ajax,
     rss_config::{get_rss_config_by_url, get_rss_dict, RssConfig},
-    rss_site::{get_magnetitem_list, MagnetItem},
+    rss_site::{get_magnetitem_list, is_retry_exhausted_rss_error, MagnetItem},
     utils::canonicalize_magnet,
 };
 
@@ -90,8 +90,17 @@ impl TaskRunner {
         let rss_dict = get_rss_dict(self.rss_path.as_ref())?;
         for configs in rss_dict.values() {
             for config in configs {
-                let item_list = get_magnetitem_list(&self.ajax, config).await?;
-                self.execute_task(service, &item_list, config).await?;
+                match get_magnetitem_list(&self.ajax, config).await {
+                    Ok(item_list) => self.execute_task(service, &item_list, config).await?,
+                    Err(err) if should_skip_rss_error(&err) => {
+                        log::warn!(
+                            "[{}] skip rss source after retries exhausted: {}",
+                            config_name_or_url(config),
+                            err
+                        );
+                    }
+                    Err(err) => return Err(err),
+                }
             }
         }
         Ok(())
@@ -108,14 +117,24 @@ impl TaskRunner {
         let mut stream = stream::iter(configs.into_iter().map(|config| {
             let ajax = self.ajax.clone();
             async move {
-                let item_list = get_magnetitem_list(&ajax, &config).await?;
-                Ok::<_, anyhow::Error>((config, item_list))
+                let result = get_magnetitem_list(&ajax, &config).await;
+                (config, result)
             }
         }))
         .buffer_unordered(RSS_FETCH_CONCURRENCY);
 
-        while let Some((config, item_list)) = stream.try_next().await? {
-            self.execute_task(service, &item_list, &config).await?;
+        while let Some((config, result)) = stream.next().await {
+            match result {
+                Ok(item_list) => self.execute_task(service, &item_list, &config).await?,
+                Err(err) if is_retry_exhausted_rss_error(&err) => {
+                    log::warn!(
+                        "[{}] skip rss source after retries exhausted: {}",
+                        config_name_or_url(&config),
+                        err
+                    );
+                }
+                Err(err) => return Err(err),
+            }
         }
         Ok(())
     }
@@ -315,6 +334,10 @@ fn classify_add_error(err: &anyhow::Error) -> AddErrorAction {
     }
 }
 
+fn should_skip_rss_error(err: &anyhow::Error) -> bool {
+    is_retry_exhausted_rss_error(err)
+}
+
 pub fn chunk_count(len: usize, size: usize) -> usize {
     if len == 0 {
         0
@@ -334,6 +357,7 @@ fn config_name_or_url(config: &RssConfig) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::anyhow;
 
     fn magnet_item(magnet: &str) -> MagnetItem {
         MagnetItem {
@@ -375,5 +399,26 @@ mod tests {
         assert_eq!(empty_num, 1);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].magnet, "magnet:?xt=urn:btih:abc123");
+    }
+
+    #[tokio::test]
+    async fn test_should_skip_rss_error_only_for_retry_exhausted_fetch_failures() {
+        let source = reqwest::Client::new()
+            .get("http://127.0.0.1:1")
+            .send()
+            .await
+            .unwrap_err();
+        let retry_exhausted: anyhow::Error = crate::rss_site::RssFetchError::new(
+            "https://example.com/rss",
+            3,
+            crate::rss_site::RssFetchStage::Body,
+            true,
+            source,
+        )
+        .into();
+        let regular = anyhow!("invalid regex filter");
+
+        assert!(should_skip_rss_error(&retry_exhausted));
+        assert!(!should_skip_rss_error(&regular));
     }
 }

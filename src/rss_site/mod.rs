@@ -9,7 +9,8 @@ use regex::Regex;
 use reqwest::Method;
 use rss::{Channel, Item};
 use std::io::BufReader;
-use std::{fs::File, path::PathBuf};
+use std::{fs::File, path::PathBuf, time::Duration};
+use tokio::time::sleep;
 
 pub use acgnx::*;
 pub use dmhy::*;
@@ -18,6 +19,9 @@ pub use nyaa::*;
 pub use rsshub::*;
 
 use crate::{request::Ajax, rss_config::RssConfig, utils::canonicalize_magnet};
+
+const RSS_FETCH_TIMEOUT: Duration = Duration::from_secs(45);
+const RSS_FETCH_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(2)];
 
 pub trait MagnetSite {
     fn get_magnet(&self, item: &Item) -> Option<String>;
@@ -43,6 +47,91 @@ pub struct MagnetItem {
     pub content: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RssFetchStage {
+    Request,
+    Status,
+    Body,
+}
+
+impl RssFetchStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Request => "request rss failed",
+            Self::Status => "rss returned non-success status",
+            Self::Body => "read rss body failed",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RssFetchError {
+    url: String,
+    attempts: usize,
+    stage: RssFetchStage,
+    retry_exhausted: bool,
+    source: reqwest::Error,
+}
+
+impl RssFetchError {
+    pub(crate) fn new(
+        url: impl Into<String>,
+        attempts: usize,
+        stage: RssFetchStage,
+        retry_exhausted: bool,
+        source: reqwest::Error,
+    ) -> Self {
+        Self {
+            url: url.into(),
+            attempts,
+            stage,
+            retry_exhausted,
+            source,
+        }
+    }
+
+    fn retry_exhausted(&self) -> bool {
+        self.retry_exhausted
+    }
+}
+
+impl std::fmt::Display for RssFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.retry_exhausted {
+            write!(
+                f,
+                "{} after {} attempts: {}",
+                self.stage.label(),
+                self.attempts,
+                self.url
+            )
+        } else {
+            write!(f, "{}: {}", self.stage.label(), self.url)
+        }
+    }
+}
+
+impl std::error::Error for RssFetchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[derive(Debug)]
+enum FetchFeedError {
+    Request {
+        stage: RssFetchStage,
+        source: reqwest::Error,
+    },
+    Other(anyhow::Error),
+    Parse(rss::Error),
+}
+
+pub fn is_retry_exhausted_rss_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<RssFetchError>()
+        .is_some_and(RssFetchError::retry_exhausted)
+}
+
 pub fn get_site(name: &str) -> Option<Box<dyn MagnetSite>> {
     let site = if name.starts_with("http") {
         url::Url::parse(name)
@@ -64,18 +153,93 @@ pub fn get_site(name: &str) -> Option<Box<dyn MagnetSite>> {
 }
 
 pub async fn get_feed(ajax: &Ajax, url: &str) -> anyhow::Result<Channel> {
-    let content = ajax
-        .gen_req(Method::GET, url)?
-        .send()
-        .await
-        .with_context(|| format!("request rss failed: {url}"))?
+    get_feed_with_retry(ajax, url, RSS_FETCH_TIMEOUT, &RSS_FETCH_RETRY_DELAYS).await
+}
+
+async fn get_feed_with_retry(
+    ajax: &Ajax,
+    url: &str,
+    timeout: Duration,
+    retry_delays: &[Duration],
+) -> anyhow::Result<Channel> {
+    let max_attempts = retry_delays.len() + 1;
+
+    for attempt in 1..=max_attempts {
+        match fetch_feed_once(ajax, url, timeout).await {
+            Ok(channel) => return Ok(channel),
+            Err(FetchFeedError::Other(err)) => return Err(err),
+            Err(FetchFeedError::Parse(err)) => return Err(err.into()),
+            Err(FetchFeedError::Request { stage, source }) => {
+                let retryable = is_retryable_reqwest_error(&source);
+                if retryable && attempt < max_attempts {
+                    let delay = retry_delays[attempt - 1];
+                    if delay.is_zero() {
+                        log::warn!(
+                            "retrying rss fetch attempt {}/{} for {} after {}",
+                            attempt + 1,
+                            max_attempts,
+                            url,
+                            source
+                        );
+                    } else {
+                        log::warn!(
+                            "retrying rss fetch attempt {}/{} for {} in {:?} after {}",
+                            attempt + 1,
+                            max_attempts,
+                            url,
+                            delay,
+                            source
+                        );
+                        sleep(delay).await;
+                    }
+                    continue;
+                }
+                return Err(RssFetchError::new(url, attempt, stage, retryable, source).into());
+            }
+        }
+    }
+
+    unreachable!()
+}
+
+async fn fetch_feed_once(
+    ajax: &Ajax,
+    url: &str,
+    timeout: Duration,
+) -> Result<Channel, FetchFeedError> {
+    let response = ajax
+        .gen_req(Method::GET, url)
+        .map_err(FetchFeedError::Other)?;
+    let response =
+        response
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|source| FetchFeedError::Request {
+                stage: RssFetchStage::Request,
+                source,
+            })?;
+    let response = response
         .error_for_status()
-        .with_context(|| format!("rss returned non-success status: {url}"))?
+        .map_err(|source| FetchFeedError::Request {
+            stage: RssFetchStage::Status,
+            source,
+        })?;
+    let content = response
         .bytes()
         .await
-        .with_context(|| format!("read rss body failed: {url}"))?;
-    let channel = Channel::read_from(&content[..])?;
-    Ok(channel)
+        .map_err(|source| FetchFeedError::Request {
+            stage: RssFetchStage::Body,
+            source,
+        })?;
+    Channel::read_from(&content[..]).map_err(FetchFeedError::Parse)
+}
+
+fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
+    err.is_timeout()
+        || err.is_connect()
+        || err.is_body()
+        || matches!(err.status(), Some(status) if status.is_server_error())
 }
 
 pub fn get_magnet_by_enclosure(item: &Item) -> String {
@@ -154,6 +318,136 @@ pub fn get_feed_by_file(path: PathBuf) -> anyhow::Result<Channel> {
 mod tests {
     use super::*;
     use crate::db::RssService;
+    use axum::{http::StatusCode, response::IntoResponse, routing::get, Router};
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+    use tokio::net::TcpListener;
+
+    const TEST_RSS_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>test</title>
+    <link>https://example.com</link>
+    <description>test feed</description>
+    <item>
+      <title>item</title>
+      <link>https://example.com/item</link>
+      <description>item</description>
+    </item>
+  </channel>
+</rss>"#;
+
+    fn test_url(listener: &TcpListener) -> String {
+        format!("http://{}/rss", listener.local_addr().unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_get_feed_retries_server_errors() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let url = test_url(&listener);
+        let app = Router::new().route(
+            "/rss",
+            get({
+                let attempts = attempts.clone();
+                move || async move {
+                    let current = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    if current < 3 {
+                        (StatusCode::BAD_GATEWAY, "temporary error").into_response()
+                    } else {
+                        (StatusCode::OK, TEST_RSS_BODY).into_response()
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let result = get_feed_with_retry(
+            &Ajax::new(None),
+            &url,
+            Duration::from_millis(200),
+            &[Duration::ZERO, Duration::ZERO],
+        )
+        .await;
+
+        server.abort();
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_get_feed_marks_timeout_as_retry_exhausted() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let url = test_url(&listener);
+        let app = Router::new().route(
+            "/rss",
+            get({
+                let attempts = attempts.clone();
+                move || async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    sleep(Duration::from_millis(50)).await;
+                    (StatusCode::OK, TEST_RSS_BODY)
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let err = get_feed_with_retry(
+            &Ajax::new(None),
+            &url,
+            Duration::from_millis(10),
+            &[Duration::ZERO, Duration::ZERO],
+        )
+        .await
+        .unwrap_err();
+
+        server.abort();
+        assert!(is_retry_exhausted_rss_error(&err));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_get_feed_does_not_retry_client_errors() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let url = test_url(&listener);
+        let app = Router::new().route(
+            "/rss",
+            get({
+                let attempts = attempts.clone();
+                move || async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::NOT_FOUND, "missing")
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let err = get_feed_with_retry(
+            &Ajax::new(None),
+            &url,
+            Duration::from_millis(200),
+            &[Duration::ZERO, Duration::ZERO],
+        )
+        .await
+        .unwrap_err();
+
+        server.abort();
+        assert!(!is_retry_exhausted_rss_error(&err));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn test_db_save_items() {
