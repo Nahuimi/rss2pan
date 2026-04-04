@@ -18,10 +18,11 @@ const DEFAULT_PROXY_ADDRESS: &str = "http://127.0.0.1:10808";
 const DEFAULT_DATABASE_PATH: &str = "db.sqlite";
 const DEFAULT_RSS_PATH: &str = "rss.json";
 const DEFAULT_LOG_LEVEL: &str = "info";
-const USER_AGENT: &str =
+pub(crate) const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const SUPPORTED_TEMPLATE_PARSERS: &[&str] = &["acgnx", "dmhy", "mikanani", "nyaa", "rsshub"];
 const SUPPORTED_LOG_LEVELS: &[&str] = &["off", "error", "warn", "info", "debug", "trace"];
+const RSS_LIBCURL_PROMOTION_STREAK: u8 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -127,6 +128,20 @@ pub struct ResolvedSiteConfig {
     pub host: String,
     pub parser: Option<String>,
     pub use_proxy: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompatRssRequestContext {
+    pub resolved: ResolvedSiteConfig,
+    pub headers: HeaderMap,
+    pub proxy_url: Option<String>,
+    pub user_agent: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RssTransportState {
+    libcurl_rescue_streak: u8,
+    prefer_libcurl_first: bool,
 }
 
 fn template_config<const N: usize, const M: usize>(
@@ -465,25 +480,43 @@ pub fn normalize_cookie_string(raw: &str) -> Option<String> {
     }
 }
 
+fn base_client_builder() -> reqwest::ClientBuilder {
+    reqwest::ClientBuilder::new()
+        .user_agent(USER_AGENT)
+        .cookie_store(true)
+        .timeout(std::time::Duration::from_secs(20))
+}
+
+fn build_client_with_proxy(proxy: Option<reqwest::Proxy>) -> Result<Client> {
+    let mut builder = base_client_builder();
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(proxy);
+    }
+    builder.build().context("build client failed")
+}
+
+fn build_compat_client(proxy_url: Option<&str>) -> Result<Client> {
+    let mut builder = base_client_builder()
+        .http1_only()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate();
+    if let Some(proxy_url) = proxy_url {
+        let proxy = reqwest::Proxy::all(proxy_url)
+            .with_context(|| format!("invalid proxy URL in config.toml: {proxy_url}"))?;
+        builder = builder.proxy(proxy);
+    }
+    builder.build().context("build compatibility client failed")
+}
+
 pub fn build_proxy_client(proxy_url: &str) -> Result<Client> {
     let proxy = reqwest::Proxy::all(proxy_url)
         .with_context(|| format!("invalid proxy URL in config.toml: {proxy_url}"))?;
-    reqwest::ClientBuilder::new()
-        .user_agent(USER_AGENT)
-        .cookie_store(true)
-        .timeout(std::time::Duration::from_secs(20))
-        .proxy(proxy)
-        .build()
-        .context("build proxy client failed")
+    build_client_with_proxy(Some(proxy)).context("build proxy client failed")
 }
 
 pub fn build_client() -> Client {
-    reqwest::ClientBuilder::new()
-        .user_agent(USER_AGENT)
-        .cookie_store(true)
-        .timeout(std::time::Duration::from_secs(20))
-        .build()
-        .unwrap()
+    build_client_with_proxy(None).unwrap()
 }
 
 fn find_template_config<'a>(
@@ -533,6 +566,7 @@ pub struct Ajax {
     app_config: Arc<Mutex<AppConfig>>,
     config_path: Arc<PathBuf>,
     cookie_override: Arc<Mutex<Option<String>>>,
+    rss_transport_state: Arc<Mutex<BTreeMap<String, RssTransportState>>>,
 }
 
 impl Ajax {
@@ -559,6 +593,7 @@ impl Ajax {
             cookie_override: Arc::new(Mutex::new(
                 cookie_override.and_then(|value| normalize_cookie_string(&value)),
             )),
+            rss_transport_state: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -641,37 +676,209 @@ impl Ajax {
         headers
     }
 
+    fn build_compat_rss_headers(&self, resolved: &ResolvedSiteConfig) -> HeaderMap {
+        let mut headers = self.build_headers(resolved);
+        headers.insert(
+            reqwest::header::ACCEPT,
+            HeaderValue::from_static(
+                "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7",
+            ),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT_LANGUAGE,
+            HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+        headers.insert(
+            reqwest::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        );
+        headers.insert(
+            reqwest::header::PRAGMA,
+            HeaderValue::from_static("no-cache"),
+        );
+        headers.insert(
+            reqwest::header::CONNECTION,
+            HeaderValue::from_static("close"),
+        );
+        headers
+    }
+
+    fn proxy_request_client(&self, host: &str) -> Result<Client> {
+        self.inner_client_proxy.clone().ok_or_else(|| {
+            anyhow!(
+                "proxy client is unavailable for host {}: {}",
+                host,
+                self.proxy_client_error
+                    .as_deref()
+                    .unwrap_or("unknown proxy configuration error")
+            )
+        })
+    }
+
+    fn fresh_proxy_request_client(&self, host: &str) -> Result<Client> {
+        let proxy_url = self.app_config.lock().unwrap().proxy.address.clone();
+        build_proxy_client(&proxy_url)
+            .map_err(|err| anyhow!("proxy client is unavailable for host {}: {}", host, err))
+    }
+
+    fn request_client(&self, resolved: &ResolvedSiteConfig, fresh: bool) -> Result<Client> {
+        if resolved.use_proxy {
+            if fresh {
+                self.fresh_proxy_request_client(&resolved.host)
+            } else {
+                self.proxy_request_client(&resolved.host)
+            }
+        } else if fresh {
+            Ok(build_client())
+        } else {
+            Ok(self.inner_client.clone())
+        }
+    }
+
+    fn compat_proxy_url(&self, resolved: &ResolvedSiteConfig) -> Option<String> {
+        resolved
+            .use_proxy
+            .then(|| self.app_config.lock().unwrap().proxy.address.clone())
+    }
+
+    fn compat_request_client(&self, resolved: &ResolvedSiteConfig) -> Result<Client> {
+        if let Some(proxy_url) = self.compat_proxy_url(resolved) {
+            build_compat_client(Some(&proxy_url)).map_err(|err| {
+                anyhow!(
+                    "compatibility client is unavailable for host {}: {}",
+                    resolved.host,
+                    err
+                )
+            })
+        } else {
+            build_compat_client(None)
+        }
+    }
+
+    fn rss_transport_host(&self, url: &str) -> Result<String> {
+        Ok(self.resolve_site_by_url(url)?.host)
+    }
+
+    fn rss_transport_state_for_host(&self, host: &str) -> RssTransportState {
+        self.rss_transport_state
+            .lock()
+            .unwrap()
+            .get(host)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn rss_prefers_libcurl_first(&self, url: &str) -> Result<bool> {
+        let host = self.rss_transport_host(url)?;
+        Ok(self
+            .rss_transport_state_for_host(&host)
+            .prefer_libcurl_first)
+    }
+
+    pub(crate) fn note_rss_libcurl_rescue(&self, url: &str) -> Result<()> {
+        let host = self.rss_transport_host(url)?;
+        let mut states = self.rss_transport_state.lock().unwrap();
+        let state = states.entry(host).or_default();
+        state.libcurl_rescue_streak = state
+            .libcurl_rescue_streak
+            .saturating_add(1)
+            .min(RSS_LIBCURL_PROMOTION_STREAK);
+        if state.libcurl_rescue_streak >= RSS_LIBCURL_PROMOTION_STREAK {
+            state.prefer_libcurl_first = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn note_rss_reqwest_success(&self, url: &str) -> Result<()> {
+        let host = self.rss_transport_host(url)?;
+        self.rss_transport_state.lock().unwrap().remove(&host);
+        Ok(())
+    }
+
+    pub(crate) fn note_rss_non_rescue_outcome(&self, url: &str) -> Result<()> {
+        let host = self.rss_transport_host(url)?;
+        let mut states = self.rss_transport_state.lock().unwrap();
+        let should_remove = if let Some(state) = states.get_mut(&host) {
+            if !state.prefer_libcurl_first {
+                state.libcurl_rescue_streak = 0;
+            }
+            state.libcurl_rescue_streak == 0 && !state.prefer_libcurl_first
+        } else {
+            false
+        };
+        if should_remove {
+            states.remove(&host);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn compat_rss_request_context(&self, url: &str) -> Result<CompatRssRequestContext> {
+        let resolved = self.resolve_site_by_url(url)?;
+        let headers = self.build_compat_rss_headers(&resolved);
+        let proxy_url = self.compat_proxy_url(&resolved);
+        Ok(CompatRssRequestContext {
+            resolved,
+            headers,
+            proxy_url,
+            user_agent: USER_AGENT,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rss_transport_state_snapshot(&self, url: &str) -> Result<(u8, bool)> {
+        let host = self.rss_transport_host(url)?;
+        let state = self.rss_transport_state_for_host(&host);
+        Ok((state.libcurl_rescue_streak, state.prefer_libcurl_first))
+    }
+
+    fn gen_req_host_internal(
+        &self,
+        method: Method,
+        url: &str,
+        host: &str,
+        fresh: bool,
+    ) -> Result<RequestBuilder> {
+        let resolved = self.resolve_site(host);
+        let headers = self.build_headers(&resolved);
+        let client = self.request_client(&resolved, fresh)?;
+        Ok(client.request(method, url).headers(headers))
+    }
+
     pub fn gen_req(&self, method: Method, url: &str) -> Result<RequestBuilder> {
         let host = url::Url::parse(url)
             .ok()
             .and_then(|url| url.host_str().map(|host| host.to_string()))
             .unwrap_or_default();
-        self.gen_req_host(method, url, &host)
+        self.gen_req_host_internal(method, url, &host, false)
+    }
+
+    pub(crate) fn gen_compat_rss_req(&self, method: Method, url: &str) -> Result<RequestBuilder> {
+        let context = self.compat_rss_request_context(url)?;
+        let client = self.compat_request_client(&context.resolved)?;
+        Ok(client.request(method, url).headers(context.headers))
+    }
+
+    pub(crate) fn gen_fresh_req(&self, method: Method, url: &str) -> Result<RequestBuilder> {
+        let host = url::Url::parse(url)
+            .ok()
+            .and_then(|url| url.host_str().map(|host| host.to_string()))
+            .unwrap_or_default();
+        self.gen_req_host_internal(method, url, &host, true)
     }
 
     pub fn gen_req_host(&self, method: Method, url: &str, host: &str) -> Result<RequestBuilder> {
-        let resolved = self.resolve_site(host);
-        let headers = self.build_headers(&resolved);
-        if resolved.use_proxy {
-            let client = self.inner_client_proxy.as_ref().ok_or_else(|| {
-                anyhow!(
-                    "proxy client is unavailable for host {}: {}",
-                    resolved.host,
-                    self.proxy_client_error
-                        .as_deref()
-                        .unwrap_or("unknown proxy configuration error")
-                )
-            })?;
-            Ok(client.request(method, url).headers(headers))
-        } else {
-            Ok(self.inner_client.request(method, url).headers(headers))
-        }
+        self.gen_req_host_internal(method, url, host, false)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{default_config_toml, Ajax, AppConfig, ResolvedSiteConfig};
+    use reqwest::header::{ACCEPT, COOKIE, REFERER};
     use reqwest::Method;
     use std::{env, fs, path::PathBuf};
 
@@ -917,6 +1124,223 @@ domains = ["mikanani.me"]
                 .and_then(|value| value.to_str().ok()),
             Some("https://mikanani.me/")
         );
+
+        remove_temp_file(&path);
+    }
+
+    #[test]
+    fn test_gen_fresh_req_uses_same_headers_as_normal_request() {
+        let path = write_temp_config("fresh-request", &default_config_toml().unwrap());
+        let ajax = Ajax::with_config_path(None, path.clone()).unwrap();
+
+        let request = ajax
+            .gen_fresh_req(Method::GET, "https://mikanime.tv/RSS/Bangumi")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::REFERER)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://mikanime.tv/")
+        );
+
+        remove_temp_file(&path);
+    }
+
+    #[test]
+    fn test_gen_compat_rss_req_adds_compatibility_headers() {
+        let path = write_temp_config("compat-request", &default_config_toml().unwrap());
+        let ajax = Ajax::with_config_path(None, path.clone()).unwrap();
+
+        let request = ajax
+            .gen_compat_rss_req(Method::GET, "https://mikanime.tv/RSS/Bangumi")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::REFERER)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://mikanime.tv/")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::ACCEPT)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::ACCEPT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("identity")
+        );
+
+        remove_temp_file(&path);
+    }
+
+    #[test]
+    fn test_compat_rss_request_context_includes_mikan_referer_and_user_agent() {
+        let path = write_temp_config("compat-context", &default_config_toml().unwrap());
+        let ajax = Ajax::with_config_path(None, path.clone()).unwrap();
+
+        let context = ajax
+            .compat_rss_request_context("https://mikanime.tv/RSS/Bangumi")
+            .unwrap();
+
+        assert_eq!(context.resolved.host, "mikanime.tv");
+        assert_eq!(
+            context
+                .headers
+                .get(REFERER)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://mikanime.tv/")
+        );
+        assert_eq!(
+            context
+                .headers
+                .get(ACCEPT)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7")
+        );
+        assert_eq!(context.user_agent, super::USER_AGENT);
+        assert!(context.proxy_url.is_none());
+
+        remove_temp_file(&path);
+    }
+
+    #[test]
+    fn test_compat_rss_request_context_includes_cookie_and_proxy() {
+        let path = write_temp_config(
+            "compat-context-cookie-proxy",
+            r#"[proxy]
+address = "http://127.0.0.1:10808"
+
+[cookies]
+"nyaa.si" = "session=abc; token=xyz"
+
+[template.nyaa]
+domains = ["nyaa.si"]
+proxy = ["nyaa.si"]
+"#,
+        );
+        let ajax = Ajax::with_config_path(None, path.clone()).unwrap();
+
+        let context = ajax
+            .compat_rss_request_context("https://nyaa.si/?page=rss&u=test")
+            .unwrap();
+
+        assert_eq!(context.resolved.host, "nyaa.si");
+        assert_eq!(context.proxy_url.as_deref(), Some("http://127.0.0.1:10808"));
+        assert_eq!(
+            context
+                .headers
+                .get(COOKIE)
+                .and_then(|value| value.to_str().ok()),
+            Some("session=abc; token=xyz")
+        );
+
+        remove_temp_file(&path);
+    }
+
+    #[test]
+    fn test_rss_transport_state_promotes_after_three_rescues() {
+        let path = write_temp_config("rss-transport-promote", &default_config_toml().unwrap());
+        let ajax = Ajax::with_config_path(None, path.clone()).unwrap();
+        let url = "https://mikanani.me/RSS/Bangumi?bangumiId=1";
+
+        for expected in [(1, false), (2, false), (3, true)] {
+            ajax.note_rss_libcurl_rescue(url).unwrap();
+            assert_eq!(ajax.rss_transport_state_snapshot(url).unwrap(), expected);
+        }
+        assert!(ajax.rss_prefers_libcurl_first(url).unwrap());
+
+        remove_temp_file(&path);
+    }
+
+    #[test]
+    fn test_rss_transport_state_is_host_scoped() {
+        let path = write_temp_config("rss-transport-host-scope", &default_config_toml().unwrap());
+        let ajax = Ajax::with_config_path(None, path.clone()).unwrap();
+        let first = "https://mikanani.me/RSS/Bangumi?bangumiId=1";
+        let second = "https://mikanime.tv/RSS/Bangumi?bangumiId=2";
+
+        ajax.note_rss_libcurl_rescue(first).unwrap();
+
+        assert_eq!(
+            ajax.rss_transport_state_snapshot(first).unwrap(),
+            (1, false)
+        );
+        assert_eq!(
+            ajax.rss_transport_state_snapshot(second).unwrap(),
+            (0, false)
+        );
+        assert!(!ajax.rss_prefers_libcurl_first(second).unwrap());
+
+        remove_temp_file(&path);
+    }
+
+    #[test]
+    fn test_rss_transport_state_resets_on_reqwest_success() {
+        let path = write_temp_config(
+            "rss-transport-reset-success",
+            &default_config_toml().unwrap(),
+        );
+        let ajax = Ajax::with_config_path(None, path.clone()).unwrap();
+        let url = "https://mikanani.me/RSS/Bangumi?bangumiId=1";
+
+        for _ in 0..3 {
+            ajax.note_rss_libcurl_rescue(url).unwrap();
+        }
+        ajax.note_rss_reqwest_success(url).unwrap();
+
+        assert_eq!(ajax.rss_transport_state_snapshot(url).unwrap(), (0, false));
+        assert!(!ajax.rss_prefers_libcurl_first(url).unwrap());
+
+        remove_temp_file(&path);
+    }
+
+    #[test]
+    fn test_rss_transport_state_non_rescue_outcome_breaks_streak_before_promotion() {
+        let path = write_temp_config(
+            "rss-transport-break-streak",
+            &default_config_toml().unwrap(),
+        );
+        let ajax = Ajax::with_config_path(None, path.clone()).unwrap();
+        let url = "https://mikanani.me/RSS/Bangumi?bangumiId=1";
+
+        ajax.note_rss_libcurl_rescue(url).unwrap();
+        ajax.note_rss_non_rescue_outcome(url).unwrap();
+
+        assert_eq!(ajax.rss_transport_state_snapshot(url).unwrap(), (0, false));
+        assert!(!ajax.rss_prefers_libcurl_first(url).unwrap());
+
+        remove_temp_file(&path);
+    }
+
+    #[test]
+    fn test_rss_transport_state_non_rescue_outcome_keeps_promoted_preference() {
+        let path = write_temp_config(
+            "rss-transport-keep-promoted",
+            &default_config_toml().unwrap(),
+        );
+        let ajax = Ajax::with_config_path(None, path.clone()).unwrap();
+        let url = "https://mikanani.me/RSS/Bangumi?bangumiId=1";
+
+        for _ in 0..3 {
+            ajax.note_rss_libcurl_rescue(url).unwrap();
+        }
+        ajax.note_rss_non_rescue_outcome(url).unwrap();
+
+        assert_eq!(ajax.rss_transport_state_snapshot(url).unwrap(), (3, true));
+        assert!(ajax.rss_prefers_libcurl_first(url).unwrap());
 
         remove_temp_file(&path);
     }

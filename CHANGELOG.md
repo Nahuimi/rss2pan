@@ -1,3 +1,10 @@
+# v0.2.3
+
+## 变化
+
+- RSS 拉取保留 `reqwest` 主路径，并内置 `libcurl` 兼容兜底；遇到特定 Cloudflare Worker 1101 错误时会自动回退，不再依赖系统 `curl`
+- 恢复 `mikanani` 系列站点在 `reqwest` 路径上的自动 `Referer`，和既有行为保持一致
+
 # v0.2.2
 
 ## 变化

@@ -1,6 +1,6 @@
 [package]
 name = "rss2pan"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Download RSS subscriptions to 115 offline tasks"
 license = "MIT"
@@ -30,6 +30,7 @@ regex = "1"
 rand = "0.8.5"
 num-bigint = "0.4.4"
 base64 = "0.22.0"
+curl = { version = "0.4", features = ["static-curl"] }
 
 [profile.release]
 lto = true

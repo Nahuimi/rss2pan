@@ -8,6 +8,8 @@
 
 支持 RSS 源: nyaa, dmhy, mikanani, acgnx, rsshub
 
+RSS 拉取默认走 `reqwest`；当兼容模式下仍遇到特定 Cloudflare Worker 1101 错误时，会自动切到内置 `libcurl` 兜底，不依赖系统 `curl`。
+
 <details>
 <summary><code><strong>「 点击查看 实现功能 」</strong></code></summary>
 
@@ -237,7 +239,11 @@ domains = ["mikanani.me", "mikanime.tv", "mikanani.kas.pub"]
 proxy = ["mikanani.me"]
 ```
 
-`mikanani` 系列站点需要 `Referer`，程序会根据当前请求域名自动生成，不需要手动再写 headers。
+`mikanani` 系列站点需要 `Referer`，程序会在 `reqwest` 和内置 `libcurl` 兼容兜底路径里根据当前请求域名自动生成，不需要手动再写 headers。
+
+#### RSS 请求兼容兜底
+
+默认情况下 RSS 使用 `reqwest` 拉取；如果兼容模式下仍返回特定 Cloudflare Worker 1101 错误，程序会自动改用内置 `libcurl` 再试一次。这个兜底逻辑已经编译进程序，不需要系统额外安装 `curl`。
 
 #### 兼容性说明
 
