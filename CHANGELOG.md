@@ -1,3 +1,15 @@
+# v0.2.1
+
+## 变化
+
+- 用 `config.toml` 替代 `node-site-config.json`，统一管理代理、站点模板和 cookie
+- 首次运行会自动生成默认 `config.toml`，支持按域名配置代理和镜像站共享模板
+- 115 cookie 优先级调整为 `--cookies` > `config.toml` > `.cookies`，并兼容更宽松的 cookie 字符串格式
+- 二维码登录成功后会把最新 cookie 回写到 `config.toml`
+- `rss.json` 改为扁平数组结构，按 URL 直接匹配配置
+- `mikanani` 系列站点会自动生成 `Referer`，简化模板配置
+- 更新 README 和示例配置，移除旧版配置格式说明
+
 # v0.2.0
 
 ## 变化
