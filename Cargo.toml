@@ -32,6 +32,9 @@ num-bigint = "0.4.4"
 base64 = "0.22.0"
 curl = { version = "0.4", features = ["static-curl"] }
 
+[target.'cfg(target_env = "musl")'.dependencies]
+openssl-sys = { version = "0.9", features = ["vendored"] }
+
 [profile.release]
 lto = true
 strip = true

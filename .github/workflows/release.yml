@@ -61,6 +61,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: taiki-e/upload-rust-binary-action@v1
+        env:
+          OPENSSL_STATIC: ${{ matrix.target == 'x86_64-unknown-linux-musl' && '1' || '' }}
         with:
           bin: rss2pan
           target: ${{ matrix.target }}

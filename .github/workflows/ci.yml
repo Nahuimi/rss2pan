@@ -27,3 +27,20 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked
+
+  musl-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        run: cargo install cross --locked
+
+      - name: Build musl release binary
+        run: cross build --locked --release --bin rss2pan --target x86_64-unknown-linux-musl
+        env:
+          OPENSSL_STATIC: "1"
