@@ -1,3 +1,11 @@
+# v0.2.2
+
+## 变化
+
+- `config.toml` 新增 `[paths]` 和 `[log]` 配置，支持自定义 `db.sqlite`、`rss.json` 路径和默认日志级别
+- 自动生成 / 回写 `config.toml` 时，模板数组改为单行输出，和 README 示例保持一致
+- `[paths]` 兼容 macOS、Linux、Windows 路径写法，Windows 未转义反斜杠路径也可直接读取
+
 # v0.2.1
 
 ## 变化

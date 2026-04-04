@@ -15,22 +15,23 @@ use std::path::PathBuf;
 use app::build_app;
 use db::RssService;
 use pan115::Pan115Client;
-use request::{ensure_default_config_file, Ajax};
+use request::{ensure_default_config_file, load_default_app_config, Ajax, AppConfig};
 use runner::{RunOptions, TaskRunner};
 use utils::get_magnet_list_by_txt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    init_logger();
     ensure_default_config_file()?;
+    let app_config = load_default_app_config()?;
+    init_logger(&app_config.log.level);
 
     let matches = build_app().get_matches();
     let ajax = Ajax::from_matches(&matches)?;
     let pan115 = Pan115Client::new(ajax.clone());
-    let rss_path = matches.get_one::<PathBuf>("rss").cloned();
+    let rss_path = Some(resolve_rss_path(&matches, &app_config));
     let runner = TaskRunner::new(
         pan115.clone(),
-        ajax,
+        ajax.clone(),
         rss_path,
         RunOptions::from_matches(&matches),
     );
@@ -74,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut service = RssService::new()?;
+    let mut service = RssService::open_path(ajax.database_path())?;
     if let Some(url) = matches.get_one::<String>("url") {
         if let Err(err) = runner.execute_url(&mut service, url).await {
             print_error(&err);
@@ -103,10 +104,10 @@ fn print_error(err: &anyhow::Error) {
     }
 }
 
-fn init_logger() {
+fn init_logger(default_level: &str) {
     use std::io::Write;
 
-    let env = env_logger::Env::default().default_filter_or("info");
+    let env = env_logger::Env::default().default_filter_or(default_level);
     let mut builder = env_logger::Builder::from_env(env);
     builder.format(|buf, record| {
         let level_style = buf.default_level_style(record.level());
@@ -118,6 +119,13 @@ fn init_logger() {
         )
     });
     builder.init();
+}
+
+fn resolve_rss_path(matches: &clap::ArgMatches, config: &AppConfig) -> PathBuf {
+    matches
+        .get_one::<PathBuf>("rss")
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(&config.paths.rss))
 }
 
 fn forced_qrcode_app(matches: &clap::ArgMatches) -> Option<&str> {
@@ -137,6 +145,33 @@ fn forced_qrcode_app(matches: &clap::ArgMatches) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::app::build_app;
+    use crate::request::AppConfig;
+
+    #[test]
+    fn test_resolve_rss_path_prefers_cli_over_config() {
+        let matches = build_app()
+            .try_get_matches_from(["rss2pan", "--rss", "custom.json"])
+            .unwrap();
+        let mut config = AppConfig::default();
+        config.paths.rss = "config.json".to_string();
+
+        assert_eq!(
+            resolve_rss_path(&matches, &config),
+            PathBuf::from("custom.json")
+        );
+    }
+
+    #[test]
+    fn test_resolve_rss_path_uses_config_default_without_cli() {
+        let matches = build_app().try_get_matches_from(["rss2pan"]).unwrap();
+        let mut config = AppConfig::default();
+        config.paths.rss = "config.json".to_string();
+
+        assert_eq!(
+            resolve_rss_path(&matches, &config),
+            PathBuf::from("config.json")
+        );
+    }
 
     #[test]
     fn test_forced_qrcode_app_is_selected_even_with_cookies() {

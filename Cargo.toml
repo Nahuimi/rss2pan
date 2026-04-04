@@ -1,6 +1,6 @@
 [package]
 name = "rss2pan"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 description = "Download RSS subscriptions to 115 offline tasks"
 license = "MIT"

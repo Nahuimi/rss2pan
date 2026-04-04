@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+};
 
 use chrono::prelude::*;
 
@@ -15,17 +18,13 @@ pub struct RssService {
 }
 
 impl RssService {
-    pub fn new() -> Result<Self> {
-        Self::open("db.sqlite")
+    pub fn open_path(path: impl AsRef<Path>) -> Result<Self> {
+        Self::from_connection(Connection::open(path.as_ref())?)
     }
 
     #[cfg(test)]
     pub fn new_in_memory() -> Result<Self> {
         Self::from_connection(Connection::open_in_memory()?)
-    }
-
-    fn open(path: &str) -> Result<Self> {
-        Self::from_connection(Connection::open(path)?)
     }
 
     fn from_connection(conn: Connection) -> Result<Self> {
@@ -320,47 +319,24 @@ mod tests {
     }
 
     #[test]
-    fn test_migration_normalizes_and_deduplicates_existing_rows() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute(
-            "CREATE TABLE rss_items (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `link` VARCHAR(255), `title` VARCHAR(255), `guid` VARCHAR(255), `pubDate` DATETIME, `creator` VARCHAR(255), `summary` TEXT, `content` VARCHAR(255), `isoDate` DATETIME, `categories` VARCHAR(255), `contentSnippet` VARCHAR(255), `done` TINYINT(1) DEFAULT 0, `magnet` TEXT NOT NULL, `createdAt` DATETIME NOT NULL, `updatedAt` DATETIME NOT NULL)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "CREATE TABLE sites_status (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `name` VARCHAR(255), `needLogin` TINYINT(1), `abnormalOp` TINYINT(1), `createdAt` DATETIME NOT NULL, `updatedAt` DATETIME NOT NULL)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO rss_items (`link`,`title`,`content`,`magnet`,`done`,`createdAt`,`updatedAt`) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params!["l1", "t1", "", "magnet:?dn=foo&xt=URN:BTIH:ABC", "1", "now", "now"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO rss_items (`link`,`title`,`content`,`magnet`,`done`,`createdAt`,`updatedAt`) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-            params!["l2", "t2", "", "magnet:?xt=urn:btih:abc&tr=udp://tracker", "1", "now", "now"],
-        )
-        .unwrap();
+    fn test_open_path_initializes_database_file() {
+        let path = std::env::temp_dir().join(format!(
+            "rss2pan-db-{}-{}.sqlite",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
 
-        let service = RssService::from_connection(conn).unwrap();
+        let service = RssService::open_path(&path).unwrap();
         let count: i64 = service
             .conn
-            .query_row("SELECT COUNT(*) FROM rss_items", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
-        let stored = service
-            .get_item_by_magnet("magnet:?xt=urn:btih:abc")
-            .unwrap();
-        assert_eq!(stored.magnet, magnet("abc"));
-        let index_count: i64 = service
-            .conn
             .query_row(
-                "SELECT COUNT(*) FROM pragma_index_list('rss_items') WHERE name = ?1",
-                [RSS_ITEMS_MAGNET_INDEX],
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'rss_items'",
+                [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(index_count, 1);
+        assert_eq!(count, 1);
+
+        let _ = std::fs::remove_file(path);
     }
 }

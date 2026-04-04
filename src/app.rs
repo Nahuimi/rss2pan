@@ -20,7 +20,7 @@ pub fn build_app() -> Command {
     let app = Command::new("rss2pan")
         .version(crate_version!())
         .about("rss to pan")
-        .arg(arg!(-r --rss [rss] "rss.json path").value_parser(value_parser!(PathBuf)))
+        .arg(arg!(-r --rss [rss] "rss config path").value_parser(value_parser!(PathBuf)))
         .arg(arg!(-u --url [url] "rss url"))
         .arg(arg!(-m --concurrent "concurrent request").action(ArgAction::SetTrue))
         .arg(arg!(--cookies [cookies] "115 cookies"))

@@ -15,9 +15,13 @@ use serde::{Deserialize, Serialize};
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 const DEFAULT_PROXY_ADDRESS: &str = "http://127.0.0.1:10808";
+const DEFAULT_DATABASE_PATH: &str = "db.sqlite";
+const DEFAULT_RSS_PATH: &str = "rss.json";
+const DEFAULT_LOG_LEVEL: &str = "info";
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const SUPPORTED_TEMPLATE_PARSERS: &[&str] = &["acgnx", "dmhy", "mikanani", "nyaa", "rsshub"];
+const SUPPORTED_LOG_LEVELS: &[&str] = &["off", "error", "warn", "info", "debug", "trace"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -29,6 +33,36 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             address: DEFAULT_PROXY_ADDRESS.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PathsConfig {
+    pub database: String,
+    pub rss: String,
+}
+
+impl Default for PathsConfig {
+    fn default() -> Self {
+        Self {
+            database: DEFAULT_DATABASE_PATH.to_string(),
+            rss: DEFAULT_RSS_PATH.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LogConfig {
+    pub level: String,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: DEFAULT_LOG_LEVEL.to_string(),
         }
     }
 }
@@ -45,6 +79,8 @@ pub struct TemplateConfig {
 #[serde(default)]
 pub struct AppConfig {
     pub proxy: ProxyConfig,
+    pub paths: PathsConfig,
+    pub log: LogConfig,
     pub cookies: BTreeMap<String, String>,
     pub template: BTreeMap<String, TemplateConfig>,
 }
@@ -78,6 +114,8 @@ impl Default for AppConfig {
 
         Self {
             proxy: ProxyConfig::default(),
+            paths: PathsConfig::default(),
+            log: LogConfig::default(),
             cookies,
             template,
         }
@@ -109,8 +147,171 @@ fn default_config_path() -> PathBuf {
     PathBuf::from(CONFIG_FILE_NAME)
 }
 
+#[derive(Default)]
+struct PathOverrides {
+    database: Option<String>,
+    rss: Option<String>,
+}
+
+fn prepare_config_content_for_parse(content: &str) -> Result<(String, PathOverrides)> {
+    let mut normalized = String::new();
+    let mut overrides = PathOverrides::default();
+    let mut in_paths = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_paths = trimmed == "[paths]";
+        }
+
+        if in_paths {
+            if let Some(path) = parse_path_override(line, "database")? {
+                overrides.database = Some(path);
+                normalized.push_str("database = \"__RSS2PAN_DATABASE_PATH__\"\n");
+                continue;
+            }
+            if let Some(path) = parse_path_override(line, "rss")? {
+                overrides.rss = Some(path);
+                normalized.push_str("rss = \"__RSS2PAN_RSS_PATH__\"\n");
+                continue;
+            }
+        }
+
+        normalized.push_str(line);
+        normalized.push('\n');
+    }
+
+    Ok((normalized, overrides))
+}
+
+fn parse_path_override(line: &str, key: &str) -> Result<Option<String>> {
+    let trimmed = line.trim_start();
+    let Some(rest) = trimmed.strip_prefix(key) else {
+        return Ok(None);
+    };
+    let Some(rest) = rest.trim_start().strip_prefix('=') else {
+        return Ok(None);
+    };
+    let rest = rest.trim_start();
+    let Some((value, tail)) = parse_path_value(rest)? else {
+        return Ok(None);
+    };
+    let tail = tail.trim_start();
+    if !tail.is_empty() && !tail.starts_with('#') {
+        bail!("invalid [paths].{key} value");
+    }
+    Ok(Some(value))
+}
+
+fn parse_path_value(input: &str) -> Result<Option<(String, &str)>> {
+    match input.chars().next() {
+        Some('"') => Ok(Some(parse_basic_path_value(input)?)),
+        Some('\'') => Ok(Some(parse_literal_path_value(input)?)),
+        _ => Ok(None),
+    }
+}
+
+fn parse_basic_path_value(input: &str) -> Result<(String, &str)> {
+    let mut backslashes = 0;
+    for (index, ch) in input.char_indices().skip(1) {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' if backslashes % 2 == 0 => {
+                let inner = &input[1..index];
+                return Ok((decode_basic_path_value(inner), &input[index + 1..]));
+            }
+            _ => backslashes = 0,
+        }
+    }
+    bail!("unterminated quoted path value")
+}
+
+fn parse_literal_path_value(input: &str) -> Result<(String, &str)> {
+    let rest = &input[1..];
+    let Some(end) = rest.find('\'') else {
+        bail!("unterminated literal path value");
+    };
+    Ok((rest[..end].to_string(), &rest[end + 1..]))
+}
+
+fn decode_basic_path_value(inner: &str) -> String {
+    if has_odd_backslash_run(inner) {
+        return inner.to_string();
+    }
+
+    let mut decoded = String::with_capacity(inner.len());
+    let mut run = 0;
+    for ch in inner.chars() {
+        if ch == '\\' {
+            run += 1;
+            continue;
+        }
+        for _ in 0..run / 2 {
+            decoded.push('\\');
+        }
+        run = 0;
+        decoded.push(ch);
+    }
+    for _ in 0..run / 2 {
+        decoded.push('\\');
+    }
+    decoded
+}
+
+fn has_odd_backslash_run(inner: &str) -> bool {
+    let mut run = 0;
+    for ch in inner.chars() {
+        if ch == '\\' {
+            run += 1;
+            continue;
+        }
+        if run % 2 == 1 {
+            return true;
+        }
+        run = 0;
+    }
+    run % 2 == 1
+}
+
+fn compact_template_arrays(content: &str) -> String {
+    let mut result = String::new();
+    let mut lines = content.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim_start();
+        if trimmed == "domains = [" || trimmed == "proxy = [" {
+            let indent_len = line.len() - trimmed.len();
+            let indent = &line[..indent_len];
+            let field = if trimmed.starts_with("domains") {
+                "domains"
+            } else {
+                "proxy"
+            };
+            let mut values = Vec::new();
+            for next_line in lines.by_ref() {
+                let next_trimmed = next_line.trim();
+                if next_trimmed == "]" {
+                    break;
+                }
+                values.push(next_trimmed.trim_end_matches(',').to_string());
+            }
+            result.push_str(&format!("{indent}{field} = [{}]\n", values.join(", ")));
+            continue;
+        }
+        result.push_str(line);
+        result.push('\n');
+    }
+
+    result
+}
+
+fn serialize_app_config(config: &AppConfig) -> Result<String> {
+    let content = toml::to_string_pretty(config).context("serialize config.toml failed")?;
+    Ok(compact_template_arrays(&content))
+}
+
 pub fn default_config_toml() -> Result<String> {
-    toml::to_string_pretty(&AppConfig::default()).context("serialize default config.toml failed")
+    serialize_app_config(&AppConfig::default())
 }
 
 pub fn ensure_default_config_file() -> Result<()> {
@@ -152,6 +353,13 @@ fn validate_legacy_config_shape(raw: &toml::Value) -> Result<()> {
 }
 
 fn validate_app_config(config: &AppConfig) -> Result<()> {
+    if !SUPPORTED_LOG_LEVELS.contains(&config.log.level.as_str()) {
+        bail!(
+            "log.level must be one of: {}",
+            SUPPORTED_LOG_LEVELS.join(", ")
+        );
+    }
+
     let mut seen_domains = BTreeMap::<String, String>::new();
 
     for (name, template) in &config.template {
@@ -206,14 +414,25 @@ fn load_app_config(path: &Path) -> Result<AppConfig> {
 
     let content =
         fs::read_to_string(path).with_context(|| format!("read {} failed", path.display()))?;
+    let (content, path_overrides) = prepare_config_content_for_parse(&content)?;
     let raw: toml::Value =
         toml::from_str(&content).with_context(|| format!("parse {} failed", path.display()))?;
     validate_legacy_config_shape(&raw)?;
-    let config: AppConfig = raw
+    let mut config: AppConfig = raw
         .try_into()
         .with_context(|| format!("parse {} failed", path.display()))?;
+    if let Some(database) = path_overrides.database {
+        config.paths.database = database;
+    }
+    if let Some(rss) = path_overrides.rss {
+        config.paths.rss = rss;
+    }
     validate_app_config(&config)?;
     Ok(config)
+}
+
+pub fn load_default_app_config() -> Result<AppConfig> {
+    load_app_config(&default_config_path())
 }
 
 fn load_cookie_file() -> Option<String> {
@@ -347,6 +566,14 @@ impl Ajax {
         Self::new(matches.get_one::<String>("cookies").cloned())
     }
 
+    pub fn app_config(&self) -> AppConfig {
+        self.app_config.lock().unwrap().clone()
+    }
+
+    pub fn database_path(&self) -> PathBuf {
+        PathBuf::from(self.app_config().paths.database)
+    }
+
     pub fn resolve_site(&self, host: &str) -> ResolvedSiteConfig {
         let config = self.app_config.lock().unwrap().clone();
         resolve_site_from_config(&config, host)
@@ -393,7 +620,7 @@ impl Ajax {
         let content = {
             let mut config = self.app_config.lock().unwrap();
             config.cookies.insert(host, cookie);
-            toml::to_string_pretty(&*config).context("serialize config.toml failed")?
+            serialize_app_config(&config)?
         };
         fs::write(self.config_path.as_ref(), content)
             .with_context(|| format!("write {} failed", self.config_path.display()))
@@ -465,6 +692,61 @@ mod tests {
 
     fn remove_temp_file(path: &PathBuf) {
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_default_config_includes_paths_and_log() {
+        let content = default_config_toml().unwrap();
+        assert!(content.contains("[paths]"));
+        assert!(content.contains("database = \"db.sqlite\""));
+        assert!(content.contains("rss = \"rss.json\""));
+        assert!(content.contains("[log]"));
+        assert!(content.contains("level = \"info\""));
+    }
+
+    #[test]
+    fn test_default_config_compacts_template_arrays() {
+        let content = default_config_toml().unwrap();
+        assert!(content
+            .contains("domains = [\"share.acgnx.se\", \"www.acgnx.se\", \"share.acgnx.net\"]"));
+        assert!(!content.contains("domains = [\n    \"share.acgnx.se\","));
+    }
+
+    #[test]
+    fn test_windows_path_with_unescaped_backslashes_is_accepted() {
+        let path = write_temp_config(
+            "windows-unescaped-path",
+            "[paths]\ndatabase = \"D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\db.sqlite\"\nrss = \"D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\rss.json\"\n\n[template.mikanani]\ndomains = [\"mikanani.me\"]\n",
+        );
+        let ajax = Ajax::with_config_path(None, path.clone()).unwrap();
+        let config = ajax.app_config();
+
+        assert_eq!(
+            config.paths.database,
+            "D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\db.sqlite"
+        );
+        assert_eq!(
+            config.paths.rss,
+            "D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\rss.json"
+        );
+
+        remove_temp_file(&path);
+    }
+
+    #[test]
+    fn test_windows_path_with_literal_string_is_accepted() {
+        let path = write_temp_config(
+            "windows-literal-path",
+            "[paths]\ndatabase = 'D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\db.sqlite'\n\n[template.mikanani]\ndomains = [\"mikanani.me\"]\n",
+        );
+        let ajax = Ajax::with_config_path(None, path.clone()).unwrap();
+
+        assert_eq!(
+            ajax.app_config().paths.database,
+            "D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\db.sqlite"
+        );
+
+        remove_temp_file(&path);
     }
 
     #[test]
@@ -548,6 +830,28 @@ domains = ["mikanani.me"]
             Err(err) => assert!(err
                 .to_string()
                 .contains("remove template.mikanani.rss_key; rss.json is now a flat array")),
+        }
+
+        remove_temp_file(&path);
+    }
+
+    #[test]
+    fn test_invalid_log_level_is_rejected() {
+        let path = write_temp_config(
+            "invalid-log-level",
+            r#"[log]
+level = "verbose"
+
+[template.mikanani]
+domains = ["mikanani.me"]
+"#,
+        );
+
+        match Ajax::with_config_path(None, path.clone()) {
+            Ok(_) => panic!("expected invalid log level config to fail"),
+            Err(err) => assert!(err
+                .to_string()
+                .contains("log.level must be one of: off, error, warn, info, debug, trace")),
         }
 
         remove_temp_file(&path);
@@ -678,7 +982,7 @@ proxy = ["mikanime.tv"]
     }
 
     #[test]
-    fn test_save_cookie_config_persists_normalized_cookie() {
+    fn test_save_cookie_config_persists_normalized_cookie_and_compacts_arrays() {
         let path = write_temp_config("save-cookie", &default_config_toml().unwrap());
         let ajax = Ajax::with_config_path(None, path.clone()).unwrap();
 
@@ -690,6 +994,9 @@ proxy = ["mikanime.tv"]
         assert_eq!(
             config.cookies.get("115.com").map(|value| value.as_str()),
             Some("UID=1; CID=2; SEID=3")
+        );
+        assert!(
+            saved.contains("domains = [\"share.acgnx.se\", \"www.acgnx.se\", \"share.acgnx.net\"]")
         );
 
         remove_temp_file(&path);

@@ -66,6 +66,9 @@ rss2pan --no-cache
 # 调整分块大小和间隔
 rss2pan --chunk-size 100 --chunk-delay 3
 
+# 指定 rss 配置文件路径；优先级高于 config.toml 里的 [paths].rss
+rss2pan --rss custom-rss.json
+
 # 指定 rss URL 离线下载
 # 如果 rss.json 存在这条 url 的配置，会读取配置。没有配置，默认离线到 115 的默认目录
 rss2pan -u "https://mikanani.me/RSS/Bangumi?bangumiId=2739&subgroupid=12"
@@ -155,7 +158,7 @@ curl -H "Content-Type: application/json" -d "{\"tasks\":[\"magnet:?xt=urn:btih:x
 
 ### config.toml
 
-`config.toml` 用来统一管理代理、镜像站模板和 cookie。
+`config.toml` 用来统一管理代理、路径、日志、镜像站模板和 cookie。
 
 <details>
 <summary><code><strong>「 点击查看 配置文件 config.toml 」</strong></code></summary>
@@ -163,6 +166,13 @@ curl -H "Content-Type: application/json" -d "{\"tasks\":[\"magnet:?xt=urn:btih:x
 ```toml
 [proxy]
 address = "http://127.0.0.1:10808"
+
+[paths]
+database = "db.sqlite"
+rss = "rss.json"
+
+[log]
+level = "info"
 
 [cookies]
 "115.com" = ""
@@ -187,6 +197,16 @@ domains = ["rsshub.app"]
 ```
 
 </details>
+
+#### 路径配置
+
+- `[paths].database`：sqlite 数据库文件路径，默认是 `db.sqlite`。
+- `[paths].rss`：默认 RSS 配置文件路径，默认是 `rss.json`。
+- CLI `--rss` 的优先级高于 `[paths].rss`。
+- 如果你想把数据库或 RSS 配置放到其他目录，可以直接改成相对路径或绝对路径。
+- macOS / Linux 可以直接写成：`"/Users/name/rss2pan/db.sqlite"`、`"/home/name/rss2pan/rss.json"`。
+- Windows 推荐写成：`'D:\ruanjian\rss2pan\db.sqlite'`，或者 `"D:/ruanjian/rss2pan/db.sqlite"`。
+- 为了兼容常见写法，`[paths]` 里也接受 `"D:\ruanjian\rss2pan\db.sqlite"` 这种未转义反斜杠路径。
 
 #### 代理配置
 
@@ -248,6 +268,25 @@ UID=115;CID=a1e;SEID=37d;KID=40b;
 
 如果 `config.toml` 可能会被提交，务必只保留示例值；实际使用时也可以继续把真实 cookie 放在 `.cookies` 里。
 
+#### 日志级别
+
+可以通过 `[log].level` 或环境变量 `RUST_LOG` 控制日志输出。
+
+支持的级别：
+
+- `off`：关闭日志输出。
+- `error`：只显示错误，适合不想看普通日志时使用。
+- `warn`：显示错误和警告。
+- `info`：默认级别，显示主要运行信息。
+- `debug`：显示更详细的调试信息。
+- `trace`：显示最详细的跟踪信息。
+
+优先级如下：
+
+1. 环境变量 `RUST_LOG`
+2. `config.toml` 里的 `[log].level`
+3. 默认值 `info`
+
 ### 日志环境变量
 
 不想看日志时：
@@ -260,4 +299,11 @@ Linux / macOS:
 
 ```bash
 export RUST_LOG=error
+```
+
+如果你更喜欢写在配置文件里，也可以：
+
+```toml
+[log]
+level = "error"
 ```
