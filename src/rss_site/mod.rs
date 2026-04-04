@@ -132,22 +132,13 @@ pub fn is_retry_exhausted_rss_error(err: &anyhow::Error) -> bool {
         .is_some_and(RssFetchError::retry_exhausted)
 }
 
-pub fn get_site(name: &str) -> Option<Box<dyn MagnetSite>> {
-    let site = if name.starts_with("http") {
-        url::Url::parse(name)
-            .ok()
-            .and_then(|url| url.host_str().map(|host| host.to_string()))
-            .unwrap_or_else(|| name.to_string())
-    } else {
-        name.to_string()
-    };
-
-    match site.as_str() {
-        "mikanani.me" | "mikanime.tv" => Some(Box::new(Mikanani)),
-        "nyaa.si" | "sukebei.nyaa.si" => Some(Box::new(Nyaa)),
-        "share.dmhy.org" => Some(Box::new(Dmhy)),
-        "share.acgnx.se" | "www.acgnx.se" | "share.acgnx.net" => Some(Box::new(Acgnx)),
-        "rsshub.app" => Some(Box::new(Rsshub)),
+pub fn get_site(template: &str) -> Option<Box<dyn MagnetSite>> {
+    match template {
+        "mikanani" => Some(Box::new(Mikanani)),
+        "nyaa" => Some(Box::new(Nyaa)),
+        "dmhy" => Some(Box::new(Dmhy)),
+        "acgnx" => Some(Box::new(Acgnx)),
+        "rsshub" => Some(Box::new(Rsshub)),
         _ => None,
     }
 }
@@ -259,8 +250,12 @@ pub async fn get_magnetitem_list(
     ajax: &Ajax,
     config: &RssConfig,
 ) -> anyhow::Result<Vec<MagnetItem>> {
-    let Some(site) = get_site(&config.url) else {
-        return Err(anyhow!("not support site: {}", config.url));
+    let resolved = ajax.resolve_site_by_url(&config.url)?;
+    let parser = resolved
+        .parser
+        .ok_or_else(|| anyhow!("not support site: {}", config.url))?;
+    let Some(site) = get_site(&parser) else {
+        return Err(anyhow!("not support site parser: {parser}"));
     };
 
     let channel = get_feed(ajax, &config.url).await?;
@@ -369,8 +364,9 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
+        let ajax = Ajax::new(None).unwrap();
         let result = get_feed_with_retry(
-            &Ajax::new(None),
+            &ajax,
             &url,
             Duration::from_millis(200),
             &[Duration::ZERO, Duration::ZERO],
@@ -402,8 +398,9 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
+        let ajax = Ajax::new(None).unwrap();
         let err = get_feed_with_retry(
-            &Ajax::new(None),
+            &ajax,
             &url,
             Duration::from_millis(10),
             &[Duration::ZERO, Duration::ZERO],
@@ -435,8 +432,9 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
+        let ajax = Ajax::new(None).unwrap();
         let err = get_feed_with_retry(
-            &Ajax::new(None),
+            &ajax,
             &url,
             Duration::from_millis(200),
             &[Duration::ZERO, Duration::ZERO],
@@ -456,7 +454,7 @@ mod tests {
         let channel = channel.unwrap();
 
         let mut service = RssService::new_in_memory().unwrap();
-        let site = get_site("mikanani.me").unwrap();
+        let site = get_site("mikanani").unwrap();
         let items: Vec<MagnetItem> = channel
             .items()
             .iter()
@@ -471,7 +469,7 @@ mod tests {
         let channel = get_feed_by_file("tests/acgnx.rss".into());
         assert!(channel.is_ok());
         let channel = channel.unwrap();
-        let site = get_site("share.acgnx.net").unwrap();
+        let site = get_site("acgnx").unwrap();
         let items: Vec<MagnetItem> = channel
             .items()
             .iter()

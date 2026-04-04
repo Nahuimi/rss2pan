@@ -343,7 +343,7 @@ impl Pan115Client {
         );
         self.ajax
             .set_cookie_for_host("115.com", Some(cookie.clone()));
-        self.ajax.save_cookie_file(&cookie)?;
+        self.ajax.save_cookie_config("115.com", &cookie)?;
         *self.user_id.lock().unwrap() = Some(login.user_id);
         Ok(())
     }
@@ -445,10 +445,9 @@ impl Pan115Client {
     }
 
     fn ensure_cookie_fields(&self) -> Result<()> {
-        let cookie = self
-            .ajax
-            .cookie_for_host("115.com")
-            .context("115 cookies is required. Use --cookies or create a .cookies file")?;
+        let cookie = self.ajax.cookie_for_host("115.com").context(
+            "115 cookies is required. Use --cookies, config.toml, or create a .cookies file",
+        )?;
         let missing = REQUIRED_COOKIE_NAMES
             .iter()
             .copied()
@@ -458,7 +457,7 @@ impl Pan115Client {
             return Ok(());
         }
         bail!(
-            "115 cookies format error, missing {}. Use --cookies \"UID=...;CID=...;SEID=...;KID=...\" or create a .cookies file",
+            "115 cookies format error, missing {}. Use --cookies \"UID=...;CID=...;SEID=...;KID=...\", config.toml, or create a .cookies file",
             missing.join(", ")
         )
     }

@@ -9,7 +9,7 @@ use crate::{
     db::RssService,
     pan115::{Pan115Client, Pan115Error, Pan115ErrorKind},
     request::Ajax,
-    rss_config::{get_rss_config_by_url, get_rss_dict, RssConfig},
+    rss_config::{get_rss_config_by_url, get_rss_list, RssConfig},
     rss_site::{get_magnetitem_list, is_retry_exhausted_rss_error, MagnetItem},
     utils::canonicalize_magnet,
 };
@@ -87,20 +87,18 @@ impl TaskRunner {
 
     pub async fn execute_all(&self, service: &mut RssService) -> Result<()> {
         self.pan115.ensure_logged_in().await?;
-        let rss_dict = get_rss_dict(self.rss_path.as_ref())?;
-        for configs in rss_dict.values() {
-            for config in configs {
-                match get_magnetitem_list(&self.ajax, config).await {
-                    Ok(item_list) => self.execute_task(service, &item_list, config).await?,
-                    Err(err) if should_skip_rss_error(&err) => {
-                        log::warn!(
-                            "[{}] skip rss source after retries exhausted: {}",
-                            config_name_or_url(config),
-                            err
-                        );
-                    }
-                    Err(err) => return Err(err),
+        let configs = get_rss_list(self.rss_path.as_ref())?;
+        for config in &configs {
+            match get_magnetitem_list(&self.ajax, config).await {
+                Ok(item_list) => self.execute_task(service, &item_list, config).await?,
+                Err(err) if should_skip_rss_error(&err) => {
+                    log::warn!(
+                        "[{}] skip rss source after retries exhausted: {}",
+                        config_name_or_url(config),
+                        err
+                    );
                 }
+                Err(err) => return Err(err),
             }
         }
         Ok(())
@@ -108,11 +106,7 @@ impl TaskRunner {
 
     pub async fn execute_all_concurrent(&self, service: &mut RssService) -> Result<()> {
         self.pan115.ensure_logged_in().await?;
-        let rss_dict = get_rss_dict(self.rss_path.as_ref())?;
-        let configs = rss_dict
-            .values()
-            .flat_map(|configs| configs.iter().cloned())
-            .collect::<Vec<_>>();
+        let configs = get_rss_list(self.rss_path.as_ref())?;
 
         let mut stream = stream::iter(configs.into_iter().map(|config| {
             let ajax = self.ajax.clone();

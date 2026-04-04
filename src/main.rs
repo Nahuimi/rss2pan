@@ -15,16 +15,17 @@ use std::path::PathBuf;
 use app::build_app;
 use db::RssService;
 use pan115::Pan115Client;
-use request::Ajax;
+use request::{ensure_default_config_file, Ajax};
 use runner::{RunOptions, TaskRunner};
 use utils::get_magnet_list_by_txt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_logger();
+    ensure_default_config_file()?;
 
     let matches = build_app().get_matches();
-    let ajax = Ajax::from_matches(&matches);
+    let ajax = Ajax::from_matches(&matches)?;
     let pan115 = Pan115Client::new(ajax.clone());
     let rss_path = matches.get_one::<PathBuf>("rss").cloned();
     let runner = TaskRunner::new(

@@ -23,8 +23,7 @@
 - [x] `--clear-task-type`
 - [x] `--chunk-delay`
 - [x] `--chunk-size`
-- [x] proxy 配置
-  - 读取 ALL_PROXY 或者 HTTPS_PROXY 环境变量
+- [x] `config.toml` 代理 / 站点 / cookie 配置
 - [x] 正则过滤 filter
 - [ ] Windows 定时任务
 - [x] 不同网站的并发任务
@@ -34,13 +33,13 @@
 
 ## 用法
 
-在同一目录下面，配置好 `rss.json` 、 `node-site-config.json` 和 `.cookies`
+在同一目录下面准备 `rss.json`。首次运行时，如果当前目录没有 `config.toml`，程序会自动生成一份默认配置。
 
 `.cookies` 已加入 `.gitignore`，不要把真实 cookie 提交到 Git 仓库。
 
 在命令行运行 `rss2pan`
 
-`.cookies` 文件内容是115的cookie字符串。手动从浏览器复制或者使用 [gcookie](https://github.com/zhifengle/gcookie)
+`.cookies` 文件内容是 115 的 cookie 字符串。手动从浏览器复制或者使用 [gcookie](https://github.com/zhifengle/gcookie)
 
 ```bat
 REM 使用 gcookie 读取浏览器的 cookie
@@ -56,7 +55,7 @@ rss2pan
 rss2pan -m
 # 使用 cookies
 rss2pan --cookies "UID=xxx;CID=xxx;SEID=xxx;KID=xxx"
-# 使用二维码登录。成功后会写入 .cookies
+# 使用二维码登录。成功后会写入 config.toml
 rss2pan -q
 # 指定二维码登录端
 rss2pan -q --qrcode-app android
@@ -68,10 +67,9 @@ rss2pan --no-cache
 rss2pan --chunk-size 100 --chunk-delay 3
 
 # 指定 rss URL 离线下载
-# 如果 rss.json 存在这条url 的配置，会读取配置。没有配置，默认离线到 115 的默认目录
+# 如果 rss.json 存在这条 url 的配置，会读取配置。没有配置，默认离线到 115 的默认目录
 rss2pan -u "https://mikanani.me/RSS/Bangumi?bangumiId=2739&subgroupid=12"
-# --clear-task-type 清除离线任务。 1: 已完成的  2: 所有任务 3: 失败任务 4: 运行的任务 5: 完成并删除的任务 6: 所有的任务
-# 清除115任务列表里面已经完成的任务
+# --clear-task-type 清除离线任务。1: 已完成的 2: 所有任务 3: 失败任务 4: 运行的任务 5: 完成并删除的任务 6: 所有的任务
 rss2pan --clear-task-type 1
 
 # 查看 magnet 子命令帮助
@@ -106,133 +104,160 @@ curl -H "Content-Type: application/json" -d "{\"tasks\":[\"magnet:?xt=urn:btih:x
 
 ## 配置
 
+### rss.json
+
+`rss.json` 现在是一个数组，不再按域名分组。程序会按 `url` 直接匹配对应配置。
+
 <details>
 <summary><code><strong>「 点击查看 配置文件 rss.json 」</strong></code></summary>
 
 ```json
-{
-  "mikanani.me": [
-    {
-      "name": "test",
-      "filter": "/简体|1080p/",
-      "url": "https://mikanani.me/RSS/Bangumi?bangumiId=2739&subgroupid=12"
-    }
-  ],
-  "nyaa.si": [
-    {
-      "name": "VCB-Studio",
-      "cid": "2479224057885794455",
-      "savepath": "VCB-Studio",
-      "url": "https://nyaa.si/?page=rss&u=VCB-Studio"
-    }
-  ],
-  "sukebei.nyaa.si": [
-    {
-      "name": "hikiko123",
-      "cid": "2479224057885794455",
-      "url": "https://sukebei.nyaa.si/?page=rss&u=hikiko123"
-    }
-  ],
-  "share.dmhy.org": [
-    {
-      "name": "水星的魔女",
-      "filter": "简日双语",
-      "cid": "2479224057885794455",
-      "savepath": "番剧/水星的魔女",
-      "url": "https://share.dmhy.org/topics/rss/rss.xml?keyword=%E6%B0%B4%E6%98%9F%E7%9A%84%E9%AD%94%E5%A5%B3&sort_id=2&team_id=0&order=date-desc"
-    }
-  ]
-}
+[
+  {
+    "name": "test",
+    "filter": "/简体|1080p/",
+    "url": "https://mikanani.me/RSS/Bangumi?bangumiId=2739&subgroupid=12"
+  },
+  {
+    "name": "VCB-Studio",
+    "cid": "2479224057885794455",
+    "savepath": "VCB-Studio",
+    "url": "https://nyaa.si/?page=rss&u=VCB-Studio"
+  },
+  {
+    "name": "hikiko123",
+    "cid": "2479224057885794455",
+    "url": "https://sukebei.nyaa.si/?page=rss&u=hikiko123"
+  },
+  {
+    "name": "水星的魔女",
+    "filter": "简日双语",
+    "cid": "2479224057885794455",
+    "savepath": "番剧/水星的魔女",
+    "url": "https://share.dmhy.org/topics/rss/rss.xml?keyword=%E6%B0%B4%E6%98%9F%E7%9A%84%E9%AD%94%E5%A5%B3&sort_id=2&team_id=0&order=date-desc"
+  }
+]
 ```
 
 </details>
 
-配置了 `filter` 后，标题包含该文字的会被离线。不设置 `filter` 默认离线全部
+配置了 `filter` 后，标题包含该文字的会被离线。不设置 `filter` 默认离线全部。
 
-`/简体|\\d{3,4}[pP]/` 使用斜线包裹的正则规则。注意转义规则
+`/简体|\\d{3,4}[pP]/` 使用斜线包裹的正则规则。注意转义规则。
 
-cid 是离线到指定的文件夹的 id 。
+`cid` 是离线到指定文件夹的 id。
 
-savepath 是可选项，直接作为 `add_task_urls` 请求体里的 `savepath` 字段提交给 115；不设置时保持 115 默认行为。
+`savepath` 是可选项，直接作为 `add_task_urls` 请求体里的 `savepath` 字段提交给 115；不设置时保持 115 默认行为。
 
 获取方法: 浏览器打开 115 的文件，地址栏像 `https://115.com/?cid=2479224057885794455&offset=0&tab=&mode=wangpan`
 
-> 其中 2479224057885794455 就是 cid
+> 其中 `2479224057885794455` 就是 `cid`
+
+### config.toml
+
+`config.toml` 用来统一管理代理、镜像站模板和 cookie。
 
 <details>
-<summary><code><strong>「 点击查看 node-site-config.json 配置 」</strong></code></summary>
+<summary><code><strong>「 点击查看 配置文件 config.toml 」</strong></code></summary>
 
-配置示例。 设置 【httpsAgent】 表示使用代理连接对应网站。不想使用代理删除对应的配置。
+```toml
+[proxy]
+address = "http://127.0.0.1:10808"
 
-```json
-{
-  "share.dmhy.org": {
-    "httpsAgent": "httpsAgent"
-  },
-  "nyaa.si": {
-    "httpsAgent": "httpsAgent"
-  },
-  "sukebei.nyaa.si": {
-    "httpsAgent": "httpsAgent"
-  },
-  "mikanime.tv": {
-    "headers": {
-      "Referer": "https://mikanime.tv/"
-    }
-  },
-  "mikanani.me": {
-    "httpsAgent": "httpsAgent",
-    "headers": {
-      "Referer": "https://mikanani.me/"
-    }
-  }
-}
+[cookies]
+"115.com" = ""
+
+[template.mikanani]
+domains = ["mikanani.me", "mikanime.tv"]
+proxy = ["mikanani.me"]
+
+[template.nyaa]
+domains = ["nyaa.si", "sukebei.nyaa.si"]
+proxy = ["nyaa.si", "sukebei.nyaa.si"]
+
+[template.dmhy]
+domains = ["share.dmhy.org"]
+proxy = ["share.dmhy.org"]
+
+[template.acgnx]
+domains = ["share.acgnx.se", "www.acgnx.se", "share.acgnx.net"]
+
+[template.rsshub]
+domains = ["rsshub.app"]
 ```
 
 </details>
 
-#### cookie 配置
+#### 代理配置
 
-在 `node-site-config.json` 文件里面配置 115.com cookie。
-如果这个文件会被提交，务必只保留示例值；实际使用更推荐 `.cookies` 或 `--cookies`。
+- `proxy.address` 支持 `http://`、`https://`、`socks5://` 等 `reqwest` 支持的代理地址。
+- 每个模板里的 `proxy` 用来列出哪些域名走代理；未列出的域名默认直连。
+- `proxy` 里的域名必须已经出现在同一个模板的 `domains` 里。
 
-```json
-{
-  "115.com": {
-    "headers": {
-      "cookie": "yourcookie"
-    }
-  }
-}
+#### 镜像站 / 模板共享
+
+`template.<parser>` 的 `<parser>` 是固定值，直接表示使用哪个 RSS 解析模板。
+
+真正影响行为的是：
+
+- `template.<parser>`：选择解析器
+- `domains`：这个模板覆盖哪些域名
+- `proxy`：这些域名里哪些走代理
+
+默认配置里：
+
+- `mikanime.tv` 复用 `mikanani` parser
+- `sukebei.nyaa.si` 复用 `nyaa` parser
+
+如果你要手动加入新的镜像站，比如 `mikanani.kas.pub`，可以这样写：
+
+```toml
+[template.mikanani]
+domains = ["mikanani.me", "mikanime.tv", "mikanani.kas.pub"]
+proxy = ["mikanani.me"]
 ```
 
-### proxy 配置
+`mikanani` 系列站点需要 `Referer`，程序会根据当前请求域名自动生成，不需要手动再写 headers。
 
-设置【httpsAgent】会使用代理。默认使用的地址 `http://127.0.0.1:10808`。
+#### 兼容性说明
 
-> 【httpsAgent】沿用的 node 版的配置。
+旧版 `[sites."host"]` / `proxy.domains` 配置已经不再支持，需要改成新的 `[template.<parser>]` 结构。
 
-需要自定义代理时，在命令行设置 Windows: set ALL_PROXY=http://youraddr:port
+旧版 `template.<name>.parser` / `template.<name>.rss_key` 也不再支持。
 
-> Linux: export ALL_PROXY=http://youraddr:port
+旧版按 host 分组的 `rss.json` 也不再支持，需要改成数组结构。
 
-```batch
-@ECHO off
-SETLOCAL
-CALL :find_dp0
-REM set ALL_PROXY=http://youraddr:port
-rss2pan.exe  %*
-ENDLOCAL
-EXIT /b %errorlevel%
-:find_dp0
-SET dp0=%~dp0
-EXIT /b
+如果同一个域名出现在多个模板里，或者 `proxy` 里写了不在 `domains` 里的域名，程序会直接报错。
+
+#### cookie 优先级
+
+115 cookie 的优先级如下：
+
+1. `--cookies`
+2. `config.toml`
+3. `.cookies`
+
+支持下面两种格式，程序会自动规范化：
+
+```text
+UID=115; CID=a1e; SEID=37d; KID=40b
+UID=115;CID=a1e;SEID=37d;KID=40b;
 ```
 
-把上面的 batch 例子改成自己的代理地址。另存为 rss2pan.cmd 和 rss2pan.exe 放在一个目录下面。
+二维码登录成功后，会把最新的 115 cookie 写回 `config.toml`。
 
-在命令行运行 rss2pan.cmd 就能够使用自己的代理的了。
+如果 `config.toml` 可能会被提交，务必只保留示例值；实际使用时也可以继续把真实 cookie 放在 `.cookies` 里。
 
-### 日志的环境变量
+### 日志环境变量
 
-不想看日志时，Windows: set RUST_LOG=error
+不想看日志时：
+
+```bat
+set RUST_LOG=error
+```
+
+Linux / macOS:
+
+```bash
+export RUST_LOG=error
+```

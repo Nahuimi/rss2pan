@@ -1,0 +1,23 @@
+[proxy]
+address = "http://127.0.0.1:10808"
+
+[cookies]
+"115.com" = ""
+
+[template.mikanani]
+domains = ["mikanani.me", "mikanime.tv"]
+proxy = ["mikanani.me"]
+
+[template.nyaa]
+domains = ["nyaa.si", "sukebei.nyaa.si"]
+proxy = ["nyaa.si", "sukebei.nyaa.si"]
+
+[template.dmhy]
+domains = ["share.dmhy.org"]
+proxy = ["share.dmhy.org"]
+
+[template.acgnx]
+domains = ["share.acgnx.se", "www.acgnx.se", "share.acgnx.net"]
+
+[template.rsshub]
+domains = ["rsshub.app"]
