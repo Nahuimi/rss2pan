@@ -123,11 +123,11 @@ jobs:
 
       - name: Build release binary
         if: ${{ !matrix.use_cross }}
-        run: cargo build --locked --release --bin rss2pan --target ${{ matrix.target }}
+        run: cargo build --release --bin rss2pan --target ${{ matrix.target }}
 
       - name: Build release binary with cross
         if: ${{ matrix.use_cross }}
-        run: cross build --locked --release --bin rss2pan --target ${{ matrix.target }}
+        run: cross build --release --bin rss2pan --target ${{ matrix.target }}
 
       - name: Package artifact (Unix)
         if: runner.os != 'Windows'
