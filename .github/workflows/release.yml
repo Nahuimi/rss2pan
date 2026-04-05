@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v0.2.4
+        required: true
+        type: string
+      force_update_existing_tag:
+        description: Force move existing tag to the selected commit
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -11,6 +22,7 @@ permissions:
 
 jobs:
   validate:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +44,59 @@ jobs:
       - name: Run tests
         run: cargo test
 
+  create-tag:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare tag
+        id: prepare
+        shell: bash
+        run: |
+          tag="${{ inputs.tag }}"
+          if [[ -z "$tag" ]]; then
+            echo "tag input is required" >&2
+            exit 1
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+(\.[0-9]+)*([.-][0-9A-Za-z]+)?$ ]]; then
+            echo "tag must start with v, for example v0.2.4" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.prepare.outputs.tag }}"
+          force="${{ inputs.force_update_existing_tag }}"
+          git fetch --tags --force
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            if [[ "$force" != "true" ]]; then
+              echo "tag $tag already exists; enable force_update_existing_tag to move it" >&2
+              exit 1
+            fi
+            git tag -f "$tag" "$GITHUB_SHA"
+            git push --force origin "refs/tags/$tag"
+          else
+            git tag "$tag" "$GITHUB_SHA"
+            git push origin "refs/tags/$tag"
+          fi
+
+      - name: Wait for tag-triggered release run
+        shell: bash
+        run: |
+          echo "tag ${{ steps.prepare.outputs.tag }} has been pushed."
+          echo "The publish workflow will continue in the tag-triggered run."
+
   release:
+    if: github.event_name == 'push'
     needs: validate
     runs-on: ubuntu-latest
     steps:
@@ -41,9 +105,13 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          target_commitish: ${{ github.sha }}
           body_path: ./CHANGELOG.md
 
   upload-assets:
+    if: github.event_name == 'push'
     needs:
       - validate
       - release
@@ -61,6 +129,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ github.ref_name }}
 
       - name: Prepare Linux toolchain for rquest
         if: runner.os == 'Linux'
@@ -114,6 +184,7 @@ jobs:
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: rss2pan
+          ref: refs/tags/${{ github.ref_name }}
           target: ${{ matrix.target }}
           tar: unix
           zip: windows
