@@ -19,6 +19,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install native dependencies for rquest
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake perl pkg-config clang libclang-dev nasm
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -27,20 +32,3 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked
-
-  musl-build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install cross
-        run: cargo install cross --locked
-
-      - name: Build musl release binary
-        run: cross build --locked --release --bin rss2pan --target x86_64-unknown-linux-musl
-        env:
-          OPENSSL_STATIC: "1"

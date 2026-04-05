@@ -8,7 +8,7 @@
 
 支持 RSS 源: nyaa, dmhy, mikanani, acgnx, rsshub
 
-RSS 拉取默认走 `reqwest`；当兼容模式下仍遇到特定 Cloudflare Worker 1101 错误时，会自动切到内置 `libcurl` 兜底，不依赖系统 `curl`。
+RSS 站点抓取已从 `reqwest` 切换到 `rquest`，并针对 Cloudflare Worker 1101 等临时错误增强了重试逻辑。
 
 <details>
 <summary><code><strong>「 点击查看 实现功能 」</strong></code></summary>
@@ -212,7 +212,7 @@ domains = ["rsshub.app"]
 
 #### 代理配置
 
-- `proxy.address` 支持 `http://`、`https://`、`socks5://` 等 `reqwest` 支持的代理地址。
+- `proxy.address` 支持 `http://`、`https://`、`socks5://` 等常见代理地址。
 - 每个模板里的 `proxy` 用来列出哪些域名走代理；未列出的域名默认直连。
 - `proxy` 里的域名必须已经出现在同一个模板的 `domains` 里。
 
@@ -239,11 +239,13 @@ domains = ["mikanani.me", "mikanime.tv", "mikanani.kas.pub"]
 proxy = ["mikanani.me"]
 ```
 
-`mikanani` 系列站点需要 `Referer`，程序会在 `reqwest` 和内置 `libcurl` 兼容兜底路径里根据当前请求域名自动生成，不需要手动再写 headers。
+`mikanani` 系列站点需要 `Referer`，程序会根据当前请求域名自动生成，不需要手动再写 headers。
 
-#### RSS 请求兼容兜底
+#### RSS 抓取和重试
 
-默认情况下 RSS 使用 `reqwest` 拉取；如果兼容模式下仍返回特定 Cloudflare Worker 1101 错误，程序会自动改用内置 `libcurl` 再试一次。这个兜底逻辑已经编译进程序，不需要系统额外安装 `curl`。
+- RSS 请求现在使用 `rquest`，会附带更接近浏览器的请求指纹。
+- 默认会对超时、连接失败、HTTP 408、HTTP 429、HTTP 5xx，以及包含 Cloudflare Worker 1101 特征的返回内容自动重试。
+- 重试退避会比旧版更长，降低站点临时异常时的失败率。
 
 #### 兼容性说明
 

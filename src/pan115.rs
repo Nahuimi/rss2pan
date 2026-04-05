@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use reqwest::{Method, RequestBuilder};
+use rquest::{Method, RequestBuilder};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 use tokio::time::sleep;
@@ -185,14 +185,14 @@ impl Pan115Client {
         Ok(self
             .ajax
             .gen_req_host(method, url, "115.com")?
-            .header(reqwest::header::USER_AGENT, UA_115_BROWSER))
+            .header(rquest::header::USER_AGENT, UA_115_BROWSER))
     }
 
     fn qrcode_req(&self, method: Method, url: &str) -> Result<RequestBuilder> {
         Ok(self
             .ajax
             .gen_req(method, url)?
-            .header(reqwest::header::USER_AGENT, UA_115_BROWSER))
+            .header(rquest::header::USER_AGENT, UA_115_BROWSER))
     }
 
     async fn request_json(&self, request: RequestBuilder, endpoint: &str) -> Result<Value> {

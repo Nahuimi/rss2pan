@@ -397,17 +397,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_should_skip_rss_error_only_for_retry_exhausted_fetch_failures() {
-        let source = reqwest::Client::new()
-            .get("http://127.0.0.1:1")
-            .send()
-            .await
-            .unwrap_err();
         let retry_exhausted: anyhow::Error = crate::rss_site::RssFetchError::new(
             "https://example.com/rss",
             3,
             crate::rss_site::RssFetchStage::Body,
             true,
-            source,
+            anyhow!("timeout"),
         )
         .into();
         let regular = anyhow!("invalid regex filter");

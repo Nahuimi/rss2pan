@@ -21,7 +21,8 @@ rss = "2.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "socks", "rustls-tls", "charset", "http2", "gzip", "brotli", "deflate"] }
+rquest = { version = "5", features = ["json", "cookies", "socks", "gzip", "brotli", "deflate"] }
+rquest-util = "2"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 log = "0.4.0"
@@ -30,10 +31,6 @@ regex = "1"
 rand = "0.8.5"
 num-bigint = "0.4.4"
 base64 = "0.22.0"
-curl = { version = "0.4", features = ["static-curl"] }
-
-[target.'cfg(target_env = "musl")'.dependencies]
-openssl-sys = { version = "0.9", features = ["vendored"] }
 
 [profile.release]
 lto = true

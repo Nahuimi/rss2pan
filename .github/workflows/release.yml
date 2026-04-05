@@ -21,6 +21,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install native dependencies for rquest
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake perl pkg-config clang libclang-dev nasm
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -60,9 +65,56 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Prepare Linux toolchain for rquest
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake perl pkg-config clang libclang-dev nasm
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            sudo apt-get install -y musl-tools
+          fi
+
+      - name: Prepare Windows toolchain for rquest
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $cmakeCandidates = @(
+            'C:\Program Files\CMake\bin',
+            'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin',
+            'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin'
+          )
+          foreach ($path in $cmakeCandidates) {
+            if (Test-Path (Join-Path $path 'cmake.exe')) {
+              $path | Out-File -FilePath $env:GITHUB_PATH -Append
+              break
+            }
+          }
+
+          if (-not (Get-Command nasm -ErrorAction SilentlyContinue)) {
+            choco install nasm llvm -y --no-progress
+          }
+
+          $clangCandidates = @(
+            'C:\Program Files\LLVM\bin',
+            'C:\Program Files (x86)\LLVM\bin',
+            'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin',
+            'C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin'
+          )
+          foreach ($path in $clangCandidates) {
+            if (Test-Path (Join-Path $path 'libclang.dll')) {
+              "LIBCLANG_PATH=$path" | Out-File -FilePath $env:GITHUB_ENV -Append
+              break
+            }
+          }
+
+      - name: Prepare macOS toolchain for rquest
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake nasm llvm
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+
       - uses: taiki-e/upload-rust-binary-action@v1
-        env:
-          OPENSSL_STATIC: ${{ matrix.target == 'x86_64-unknown-linux-musl' && '1' || '' }}
         with:
           bin: rss2pan
           target: ${{ matrix.target }}
