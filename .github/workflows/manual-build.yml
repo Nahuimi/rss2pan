@@ -1,0 +1,92 @@
+name: Manual Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Build target
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - x86_64-pc-windows-msvc
+          - x86_64-apple-darwin
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: ${{ github.event.inputs.target == 'all' || github.event.inputs.target == matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive_name: rss2pan-x86_64-unknown-linux-gnu.tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive_name: rss2pan-x86_64-unknown-linux-musl.tar.gz
+            use_cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive_name: rss2pan-x86_64-pc-windows-msvc.zip
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive_name: rss2pan-x86_64-apple-darwin.tar.gz
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross
+        if: ${{ matrix.use_cross }}
+        run: cargo install cross --locked
+
+      - name: Build release binary
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --locked --release --bin rss2pan --target ${{ matrix.target }}
+
+      - name: Build release binary with cross
+        if: ${{ matrix.use_cross }}
+        run: cross build --locked --release --bin rss2pan --target ${{ matrix.target }}
+        env:
+          OPENSSL_STATIC: "1"
+
+      - name: Package artifact (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          stage_dir="rss2pan-${{ matrix.target }}"
+          mkdir -p "$stage_dir"
+          cp "target/${{ matrix.target }}/release/rss2pan" "$stage_dir/"
+          tar -czf "dist/${{ matrix.archive_name }}" "$stage_dir"
+
+      - name: Package artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $stageDir = "rss2pan-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/rss2pan.exe" "$stageDir/rss2pan.exe"
+          Compress-Archive -Path $stageDir -DestinationPath "dist/${{ matrix.archive_name }}" -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rss2pan-${{ matrix.target }}
+          path: dist/${{ matrix.archive_name }}
+          retention-days: 14
