@@ -2,7 +2,7 @@
 
 ## 变化
 
-- RSS 站点抓取从 `reqwest` 切换到 `rquest`
+- RSS 站点抓取从 `reqwest` 切换到 `wreq`
 - RSS 重试策略增强，增加退避次数，并对 Cloudflare Worker 1101、HTTP 429、HTTP 5xx 等临时错误自动重试
 
 # v0.2.2

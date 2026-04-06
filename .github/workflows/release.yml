@@ -33,7 +33,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install native dependencies for rquest
+      - name: Install native dependencies for wreq
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake perl pkg-config clang libclang-dev nasm
@@ -132,7 +132,7 @@ jobs:
         with:
           ref: refs/tags/${{ github.ref_name }}
 
-      - name: Prepare Linux toolchain for rquest
+      - name: Prepare Linux toolchain for wreq
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
@@ -141,7 +141,7 @@ jobs:
             sudo apt-get install -y musl-tools
           fi
 
-      - name: Prepare Windows toolchain for rquest
+      - name: Prepare Windows toolchain for wreq
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -174,7 +174,7 @@ jobs:
             }
           }
 
-      - name: Prepare macOS toolchain for rquest
+      - name: Prepare macOS toolchain for wreq
         if: runner.os == 'macOS'
         run: |
           brew install cmake nasm llvm

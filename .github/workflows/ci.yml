@@ -19,7 +19,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install native dependencies for rquest
+      - name: Install native dependencies for wreq
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake perl pkg-config clang libclang-dev nasm

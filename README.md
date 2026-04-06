@@ -8,7 +8,7 @@
 
 支持 RSS 源: nyaa, dmhy, mikanani, acgnx, rsshub
 
-RSS 站点抓取已从 `reqwest` 切换到 `rquest`，并针对 Cloudflare Worker 1101 等临时错误增强了重试逻辑。
+RSS 站点抓取已从 `reqwest` 切换到 `wreq`，并针对 Cloudflare Worker 1101 等临时错误增强了重试逻辑。
 
 <details>
 <summary><code><strong>「 点击查看 实现功能 」</strong></code></summary>
@@ -243,7 +243,7 @@ proxy = ["mikanani.me"]
 
 #### RSS 抓取和重试
 
-- RSS 请求现在使用 `rquest`，会附带更接近浏览器的请求指纹。
+- RSS 请求现在使用 `wreq`。
 - 默认会对超时、连接失败、HTTP 408、HTTP 429、HTTP 5xx，以及包含 Cloudflare Worker 1101 特征的返回内容自动重试。
 - 重试退避会比旧版更长，降低站点临时异常时的失败率。
 

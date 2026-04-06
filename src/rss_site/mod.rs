@@ -6,11 +6,11 @@ mod rsshub;
 
 use anyhow::{anyhow, Context};
 use regex::Regex;
-use rquest::Method;
 use rss::{Channel, Item};
 use std::io::BufReader;
 use std::{fs::File, path::PathBuf, time::Duration};
 use tokio::time::sleep;
+use wreq::Method;
 
 pub use acgnx::*;
 pub use dmhy::*;
@@ -249,7 +249,7 @@ async fn fetch_feed_once(
             .await
             .map_err(|source| FetchFeedError::Request {
                 stage: RssFetchStage::Request,
-                retryable: is_retryable_rquest_error(&source),
+                retryable: is_retryable_wreq_error(&source),
                 detail: None,
                 source: anyhow::Error::new(source),
             })?;
@@ -273,7 +273,7 @@ async fn fetch_feed_once(
         .await
         .map_err(|source| FetchFeedError::Request {
             stage: RssFetchStage::Body,
-            retryable: is_retryable_rquest_error(&source),
+            retryable: is_retryable_wreq_error(&source),
             detail: None,
             source: anyhow::Error::new(source),
         })?;
@@ -315,13 +315,13 @@ fn log_retry(
     }
 }
 
-fn is_retryable_status(status: rquest::StatusCode) -> bool {
-    status == rquest::StatusCode::REQUEST_TIMEOUT
-        || status == rquest::StatusCode::TOO_MANY_REQUESTS
+fn is_retryable_status(status: wreq::StatusCode) -> bool {
+    status == wreq::StatusCode::REQUEST_TIMEOUT
+        || status == wreq::StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
 }
 
-fn is_retryable_rquest_error(err: &rquest::Error) -> bool {
+fn is_retryable_wreq_error(err: &wreq::Error) -> bool {
     err.is_timeout()
         || err.is_connect()
         || err.is_body()

@@ -7,12 +7,11 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::ArgMatches;
-use rquest::{
+use serde::{Deserialize, Serialize};
+use wreq::{
     header::{HeaderMap, HeaderValue},
     Client, Method, RequestBuilder,
 };
-use rquest_util::Emulation;
-use serde::{Deserialize, Serialize};
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 const DEFAULT_PROXY_ADDRESS: &str = "http://127.0.0.1:10808";
@@ -466,15 +465,11 @@ pub fn normalize_cookie_string(raw: &str) -> Option<String> {
     }
 }
 
-fn build_client_with_proxy(proxy_url: Option<&str>, emulate_browser: bool) -> Result<Client> {
+fn build_client_with_proxy(proxy_url: Option<&str>) -> Result<Client> {
     let mut builder = Client::builder()
+        .user_agent(USER_AGENT)
         .cookie_store(true)
         .timeout(std::time::Duration::from_secs(20));
-    if emulate_browser {
-        builder = builder.emulation(Emulation::Chrome136);
-    } else {
-        builder = builder.user_agent(USER_AGENT);
-    }
     if let Some(proxy_url) = proxy_url {
         builder = builder.proxy(proxy_url);
     }
@@ -482,19 +477,19 @@ fn build_client_with_proxy(proxy_url: Option<&str>, emulate_browser: bool) -> Re
 }
 
 pub fn build_proxy_client(proxy_url: &str) -> Result<Client> {
-    build_client_with_proxy(Some(proxy_url), false).context("build proxy client failed")
+    build_client_with_proxy(Some(proxy_url)).context("build proxy client failed")
 }
 
 fn build_rss_proxy_client(proxy_url: &str) -> Result<Client> {
-    build_client_with_proxy(Some(proxy_url), true).context("build rss proxy client failed")
+    build_client_with_proxy(Some(proxy_url)).context("build rss proxy client failed")
 }
 
 pub fn build_client() -> Client {
-    build_client_with_proxy(None, false).unwrap()
+    build_client_with_proxy(None).unwrap()
 }
 
 pub fn build_rss_client() -> Client {
-    build_client_with_proxy(None, true).unwrap()
+    build_client_with_proxy(None).unwrap()
 }
 
 fn find_template_config<'a>(
@@ -652,12 +647,12 @@ impl Ajax {
         let mut headers = HeaderMap::new();
         if resolved.parser.as_deref() == Some("mikanani") {
             if let Ok(value) = HeaderValue::from_str(&format!("https://{}/", resolved.host)) {
-                headers.insert(rquest::header::REFERER, value);
+                headers.insert(wreq::header::REFERER, value);
             }
         }
         if let Some(cookie) = self.resolved_cookie(&resolved.host) {
             if let Ok(value) = HeaderValue::from_str(&cookie) {
-                headers.insert(rquest::header::COOKIE, value);
+                headers.insert(wreq::header::COOKIE, value);
             }
         }
         headers
@@ -666,20 +661,20 @@ impl Ajax {
     fn build_rss_headers(&self, resolved: &ResolvedSiteConfig) -> HeaderMap {
         let mut headers = self.build_headers(resolved);
         headers.insert(
-            rquest::header::ACCEPT,
+            wreq::header::ACCEPT,
             HeaderValue::from_static(
                 "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7",
             ),
         );
         headers.insert(
-            rquest::header::ACCEPT_LANGUAGE,
+            wreq::header::ACCEPT_LANGUAGE,
             HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"),
         );
         headers.insert(
-            rquest::header::CACHE_CONTROL,
+            wreq::header::CACHE_CONTROL,
             HeaderValue::from_static("no-cache"),
         );
-        headers.insert(rquest::header::PRAGMA, HeaderValue::from_static("no-cache"));
+        headers.insert(wreq::header::PRAGMA, HeaderValue::from_static("no-cache"));
         headers
     }
 
@@ -737,8 +732,8 @@ impl Ajax {
 #[cfg(test)]
 mod tests {
     use super::{default_config_toml, Ajax, AppConfig, ResolvedSiteConfig};
-    use rquest::Method;
     use std::{env, fs, path::PathBuf};
+    use wreq::Method;
 
     fn temp_path(name: &str) -> PathBuf {
         env::temp_dir().join(format!(
@@ -961,7 +956,7 @@ domains = ["mikanani.me"]
         assert_eq!(
             mikanime
                 .headers()
-                .get(rquest::header::REFERER)
+                .get(wreq::header::REFERER)
                 .and_then(|value| value.to_str().ok()),
             Some("https://mikanime.tv/")
         );
@@ -978,7 +973,7 @@ domains = ["mikanani.me"]
         assert_eq!(
             mikanani
                 .headers()
-                .get(rquest::header::REFERER)
+                .get(wreq::header::REFERER)
                 .and_then(|value| value.to_str().ok()),
             Some("https://mikanani.me/")
         );
@@ -1000,14 +995,14 @@ domains = ["mikanani.me"]
         assert_eq!(
             request
                 .headers()
-                .get(rquest::header::REFERER)
+                .get(wreq::header::REFERER)
                 .and_then(|value| value.to_str().ok()),
             Some("https://mikanime.tv/")
         );
         assert_eq!(
             request
                 .headers()
-                .get(rquest::header::ACCEPT)
+                .get(wreq::header::ACCEPT)
                 .and_then(|value| value.to_str().ok()),
             Some("application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7")
         );
