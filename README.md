@@ -15,6 +15,7 @@ RSS 站点抓取已从 `reqwest` 切换到 `wreq`，并针对 Cloudflare Worker 
 
 - [x] 115 离线功能
 - [x] sqlite 存储数据
+- [x] 黑名单 sqlite 存储与自动过期
 - [x] 实现 cli
 - [x] `/add` HTTP API
 - [x] `savepath` 支持
@@ -171,10 +172,15 @@ address = "http://127.0.0.1:10808"
 
 [paths]
 database = "db.sqlite"
+blacklist = "blacklist.sqlite"
 rss = "rss.json"
 
 [log]
 level = "info"
+
+[blacklist]
+exclude = ""
+retention_months = 6
 
 [cookies]
 "115.com" = ""
@@ -203,12 +209,30 @@ domains = ["rsshub.app"]
 #### 路径配置
 
 - `[paths].database`：sqlite 数据库文件路径，默认是 `db.sqlite`。
+- `[paths].blacklist`：RSS 黑名单数据库路径，默认是 `blacklist.sqlite`。
 - `[paths].rss`：默认 RSS 配置文件路径，默认是 `rss.json`。
 - CLI `--rss` 的优先级高于 `[paths].rss`。
 - 如果你想把数据库或 RSS 配置放到其他目录，可以直接改成相对路径或绝对路径。
 - macOS / Linux 可以直接写成：`"/Users/name/rss2pan/db.sqlite"`、`"/home/name/rss2pan/rss.json"`。
 - Windows 推荐写成：`'D:\ruanjian\rss2pan\db.sqlite'`，或者 `"D:/ruanjian/rss2pan/db.sqlite"`。
 - 为了兼容常见写法，`[paths]` 里也接受 `"D:\ruanjian\rss2pan\db.sqlite"` 这种未转义反斜杠路径。
+
+#### RSS 黑名单
+
+- `[blacklist].exclude`：和 `rss.json` 里的 `filter` 规则一致。普通字符串按标题包含匹配；`/regex/` 按正则匹配。
+- `[blacklist].retention_months`：黑名单保留月数，默认 `6`。程序启动时会自动删除更早的黑名单记录。
+- 当某个 RSS 源里出现匹配 `exclude` 的标题，并且当前 RSS 处理成功后，程序会把这条记录的 `link`、`title`、`createdAt`、`updatedAt` 以及 RSS 链接写入黑名单库。
+- 黑名单库按 RSS 链接去重；同一条 RSS 下一次运行会直接跳过，不再抓取和提交。
+
+例如：
+
+```toml
+[blacklist]
+exclude = "/(?i)(合集|fin|end)/"
+retention_months = 6
+```
+
+上面的配置适合把出现 `合集`、`fin`、`end` 的 RSS 源视为完结源，后续自动跳过。
 
 #### 代理配置
 

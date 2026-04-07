@@ -8,12 +8,17 @@ use chrono::prelude::*;
 use anyhow::{bail, Result};
 use rusqlite::{params, params_from_iter, Connection, Error};
 
-use crate::{rss_site::MagnetItem, utils::canonicalize_magnet};
+use crate::{rss_config::normalize_rss_url, rss_site::MagnetItem, utils::canonicalize_magnet};
 
 const EXISTING_MAGNETS_CHUNK_SIZE: usize = 500;
 const RSS_ITEMS_MAGNET_INDEX: &str = "idx_rss_items_magnet";
+const RSS_BLACKLIST_LINK_INDEX: &str = "idx_rss_blacklist_rss_link";
 
 pub struct RssService {
+    conn: Connection,
+}
+
+pub struct BlacklistService {
     conn: Connection,
 }
 
@@ -222,6 +227,135 @@ impl RssService {
     }
 }
 
+impl BlacklistService {
+    pub fn open_path(path: impl AsRef<Path>, retention_months: u32) -> Result<Self> {
+        let mut service = Self::from_connection(Connection::open(path.as_ref())?)?;
+        service.prune_expired(retention_months)?;
+        Ok(service)
+    }
+
+    #[cfg(test)]
+    pub fn new_in_memory(retention_months: u32) -> Result<Self> {
+        let mut service = Self::from_connection(Connection::open_in_memory()?)?;
+        service.prune_expired(retention_months)?;
+        Ok(service)
+    }
+
+    fn from_connection(conn: Connection) -> Result<Self> {
+        conn.execute(
+            "CREATE TABLE if not exists `rss_blacklist` (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `link` VARCHAR(255), `title` VARCHAR(255), `rssLink` TEXT NOT NULL, `createdAt` DATETIME NOT NULL, `updatedAt` DATETIME NOT NULL)",
+            (),
+        )?;
+        let mut service = Self { conn };
+        service.migrate_blacklist_schema()?;
+        service.migrate_blacklist_items()?;
+        Ok(service)
+    }
+
+    pub fn prune_expired(&mut self, retention_months: u32) -> Result<usize> {
+        let modifier = format!("-{retention_months} months");
+        let rows = self.conn.execute(
+            "DELETE FROM rss_blacklist WHERE datetime(updatedAt) < datetime('now', ?1)",
+            [modifier.as_str()],
+        )?;
+        Ok(rows)
+    }
+
+    pub fn contains_rss_url(&self, rss_url: &str) -> Result<bool> {
+        let rss_link = normalize_rss_url(rss_url);
+        let exists: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rss_blacklist WHERE rssLink = ?1)",
+            [rss_link.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
+    pub fn blacklist_rss(&self, rss_url: &str, item: &MagnetItem) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let rss_link = normalize_rss_url(rss_url);
+        self.conn.execute(
+            "INSERT INTO rss_blacklist (`link`,`title`,`rssLink`,`createdAt`,`updatedAt`) VALUES (?1,?2,?3,?4,?4)
+             ON CONFLICT(`rssLink`) DO UPDATE SET `link` = excluded.`link`, `title` = excluded.`title`, `updatedAt` = excluded.`updatedAt`",
+            params![item.link.as_str(), item.title.as_str(), rss_link, now],
+        )?;
+        Ok(())
+    }
+
+    fn migrate_blacklist_schema(&mut self) -> Result<()> {
+        let has_rss_key = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(rss_blacklist)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .any(|column| column == "rssKey")
+        };
+
+        if !has_rss_key {
+            return Ok(());
+        }
+
+        let tx = self.conn.transaction()?;
+        tx.execute("ALTER TABLE rss_blacklist RENAME TO rss_blacklist_old", [])?;
+        tx.execute(
+            "CREATE TABLE rss_blacklist (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `link` VARCHAR(255), `title` VARCHAR(255), `rssLink` TEXT NOT NULL, `createdAt` DATETIME NOT NULL, `updatedAt` DATETIME NOT NULL)",
+            [],
+        )?;
+        tx.execute(
+            "INSERT INTO rss_blacklist (`id`,`link`,`title`,`rssLink`,`createdAt`,`updatedAt`)
+             SELECT `id`,`link`,`title`,`rssLink`,`createdAt`,`updatedAt` FROM rss_blacklist_old",
+            [],
+        )?;
+        tx.execute("DROP TABLE rss_blacklist_old", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn migrate_blacklist_items(&mut self) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let rows = {
+            let mut stmt = tx.prepare("SELECT id, rssLink FROM rss_blacklist ORDER BY id")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let mut keep_by_rss_link = HashMap::new();
+        let mut deletions = Vec::new();
+        let mut updates = Vec::new();
+        for (id, rss_link) in rows {
+            let normalized = normalize_rss_url(&rss_link);
+            if keep_by_rss_link.insert(normalized.clone(), id).is_some() {
+                deletions.push(id);
+                continue;
+            }
+            if rss_link != normalized {
+                updates.push((normalized, id));
+            }
+        }
+
+        for id in deletions {
+            tx.execute("DELETE FROM rss_blacklist WHERE id = ?1", [id])?;
+        }
+        for (rss_link, id) in updates {
+            tx.execute(
+                "UPDATE rss_blacklist SET rssLink = ?1 WHERE id = ?2",
+                params![rss_link, id],
+            )?;
+        }
+        tx.execute("DROP INDEX IF EXISTS idx_rss_blacklist_rss_key", [])?;
+        tx.execute(
+            &format!(
+                "CREATE UNIQUE INDEX IF NOT EXISTS {RSS_BLACKLIST_LINK_INDEX} ON rss_blacklist(rssLink)"
+            ),
+            [],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+
 fn repeat_vars(count: usize) -> String {
     std::iter::repeat_n("?", count)
         .collect::<Vec<_>>()
@@ -338,5 +472,92 @@ mod tests {
         assert_eq!(count, 1);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_blacklist_service_tracks_rss_urls_by_normalized_key() {
+        let service = BlacklistService::new_in_memory(6).unwrap();
+        let item = MagnetItem {
+            title: "合集".to_string(),
+            link: "https://example.com/item".to_string(),
+            magnet: magnet("abc"),
+            content: None,
+            description: None,
+        };
+
+        service
+            .blacklist_rss(
+                "https://example.com/rss?subgroupid=12&bangumiId=2739",
+                &item,
+            )
+            .unwrap();
+
+        assert!(service
+            .contains_rss_url("https://example.com/rss?bangumiId=2739&subgroupid=12")
+            .unwrap());
+    }
+
+    #[test]
+    fn test_blacklist_service_prunes_expired_rows() {
+        let mut service = BlacklistService::new_in_memory(6).unwrap();
+        service
+            .conn
+            .execute(
+                "INSERT INTO rss_blacklist (`link`,`title`,`rssLink`,`createdAt`,`updatedAt`) VALUES (?1,?2,?3,?4,?5)",
+                params![
+                    "https://example.com/item",
+                    "old",
+                    normalize_rss_url("https://example.com/rss"),
+                    "2025-01-01T00:00:00Z",
+                    "2025-01-01T00:00:00Z",
+                ],
+            )
+            .unwrap();
+
+        let deleted = service.prune_expired(6).unwrap();
+        assert_eq!(deleted, 1);
+        assert!(!service.contains_rss_url("https://example.com/rss").unwrap());
+    }
+
+    #[test]
+    fn test_blacklist_service_migrates_old_rsskey_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE rss_blacklist (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `link` VARCHAR(255), `title` VARCHAR(255), `rssLink` TEXT NOT NULL, `rssKey` TEXT NOT NULL, `createdAt` DATETIME NOT NULL, `updatedAt` DATETIME NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rss_blacklist (`link`,`title`,`rssLink`,`rssKey`,`createdAt`,`updatedAt`) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                "https://example.com/item",
+                "old",
+                "https://example.com/rss?b=2&a=1",
+                "example.com/rss?a=1&b=2",
+                "2026-01-01T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+            ],
+        )
+        .unwrap();
+
+        let service = BlacklistService::from_connection(conn).unwrap();
+
+        assert!(service
+            .contains_rss_url("https://example.com/rss?a=1&b=2")
+            .unwrap());
+
+        let columns = {
+            let mut stmt = service
+                .conn
+                .prepare("PRAGMA table_info(rss_blacklist)")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        assert!(!columns.iter().any(|column| column == "rssKey"));
     }
 }

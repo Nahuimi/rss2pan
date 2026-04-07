@@ -1,12 +1,13 @@
 use std::{collections::HashSet, path::PathBuf, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::ArgMatches;
 use futures::{stream, StreamExt};
+use regex::Regex;
 use tokio::time::sleep;
 
 use crate::{
-    db::RssService,
+    db::{BlacklistService, RssService},
     pan115::{Pan115Client, Pan115Error, Pan115ErrorKind},
     request::Ajax,
     rss_config::{get_rss_config_by_url, get_rss_list, RssConfig},
@@ -78,19 +79,38 @@ impl TaskRunner {
         self.options
     }
 
-    pub async fn execute_url(&self, service: &mut RssService, url: &str) -> Result<()> {
-        self.pan115.ensure_logged_in().await?;
+    pub async fn execute_url(
+        &self,
+        service: &mut RssService,
+        blacklist: &BlacklistService,
+        url: &str,
+    ) -> Result<()> {
         let config = get_rss_config_by_url(self.rss_path.as_ref(), url)?;
+        if should_skip_blacklisted_rss(blacklist, &config)? {
+            return Ok(());
+        }
+        self.pan115.ensure_logged_in().await?;
         let item_list = get_magnetitem_list(&self.ajax, &config).await?;
-        self.execute_task(service, &item_list, &config).await
+        self.execute_task(service, blacklist, &item_list, &config)
+            .await
     }
 
-    pub async fn execute_all(&self, service: &mut RssService) -> Result<()> {
+    pub async fn execute_all(
+        &self,
+        service: &mut RssService,
+        blacklist: &BlacklistService,
+    ) -> Result<()> {
+        let configs = filter_blacklisted_configs(blacklist, get_rss_list(self.rss_path.as_ref())?)?;
+        if configs.is_empty() {
+            return Ok(());
+        }
         self.pan115.ensure_logged_in().await?;
-        let configs = get_rss_list(self.rss_path.as_ref())?;
         for config in &configs {
             match get_magnetitem_list(&self.ajax, config).await {
-                Ok(item_list) => self.execute_task(service, &item_list, config).await?,
+                Ok(item_list) => {
+                    self.execute_task(service, blacklist, &item_list, config)
+                        .await?
+                }
                 Err(err) if should_skip_rss_error(&err) => {
                     log::warn!(
                         "[{}] skip rss source after retries exhausted: {}",
@@ -104,9 +124,16 @@ impl TaskRunner {
         Ok(())
     }
 
-    pub async fn execute_all_concurrent(&self, service: &mut RssService) -> Result<()> {
+    pub async fn execute_all_concurrent(
+        &self,
+        service: &mut RssService,
+        blacklist: &BlacklistService,
+    ) -> Result<()> {
+        let configs = filter_blacklisted_configs(blacklist, get_rss_list(self.rss_path.as_ref())?)?;
+        if configs.is_empty() {
+            return Ok(());
+        }
         self.pan115.ensure_logged_in().await?;
-        let configs = get_rss_list(self.rss_path.as_ref())?;
 
         let mut stream = stream::iter(configs.into_iter().map(|config| {
             let ajax = self.ajax.clone();
@@ -119,7 +146,10 @@ impl TaskRunner {
 
         while let Some((config, result)) = stream.next().await {
             match result {
-                Ok(item_list) => self.execute_task(service, &item_list, &config).await?,
+                Ok(item_list) => {
+                    self.execute_task(service, blacklist, &item_list, &config)
+                        .await?
+                }
                 Err(err) if is_retry_exhausted_rss_error(&err) => {
                     log::warn!(
                         "[{}] skip rss source after retries exhausted: {}",
@@ -154,10 +184,14 @@ impl TaskRunner {
     async fn execute_task(
         &self,
         service: &mut RssService,
+        blacklist: &BlacklistService,
         item_list: &[MagnetItem],
         config: &RssConfig,
     ) -> Result<()> {
         let (deduped, empty_num) = dedup_task_items(item_list);
+        let app_config = self.ajax.app_config();
+        let blacklist_candidate =
+            find_blacklist_candidate(&deduped, app_config.blacklist.exclude_pattern())?;
 
         if empty_num > 0 {
             log::warn!(
@@ -188,6 +222,7 @@ impl TaskRunner {
 
         if tasks.is_empty() {
             log::info!("[{}] has 0 task", config_name_or_url(config));
+            blacklist_matched_rss(blacklist, config, blacklist_candidate.as_ref())?;
             return Ok(());
         }
 
@@ -229,6 +264,7 @@ impl TaskRunner {
             }
         }
 
+        blacklist_matched_rss(blacklist, config, blacklist_candidate.as_ref())?;
         Ok(())
     }
 }
@@ -332,6 +368,78 @@ fn should_skip_rss_error(err: &anyhow::Error) -> bool {
     is_retry_exhausted_rss_error(err)
 }
 
+fn filter_blacklisted_configs(
+    blacklist: &BlacklistService,
+    configs: Vec<RssConfig>,
+) -> Result<Vec<RssConfig>> {
+    let mut filtered = Vec::with_capacity(configs.len());
+    for config in configs {
+        if should_skip_blacklisted_rss(blacklist, &config)? {
+            continue;
+        }
+        filtered.push(config);
+    }
+    Ok(filtered)
+}
+
+fn should_skip_blacklisted_rss(blacklist: &BlacklistService, config: &RssConfig) -> Result<bool> {
+    let is_blacklisted = blacklist.contains_rss_url(&config.url)?;
+    if is_blacklisted {
+        log::info!(
+            "[{}] skip blacklisted rss source: {}",
+            config_name_or_url(config),
+            config.url
+        );
+    }
+    Ok(is_blacklisted)
+}
+
+fn find_blacklist_candidate(
+    items: &[MagnetItem],
+    pattern: Option<&str>,
+) -> Result<Option<MagnetItem>> {
+    let Some(pattern) = pattern else {
+        return Ok(None);
+    };
+    let regex = compile_rule_regex(pattern, "blacklist.exclude")?;
+    Ok(items
+        .iter()
+        .find(|item| title_matches_rule(&item.title, pattern, regex.as_ref()))
+        .cloned())
+}
+
+fn blacklist_matched_rss(
+    blacklist: &BlacklistService,
+    config: &RssConfig,
+    item: Option<&MagnetItem>,
+) -> Result<()> {
+    let Some(item) = item else {
+        return Ok(());
+    };
+    blacklist.blacklist_rss(&config.url, item)?;
+    log::info!(
+        "[{}] blacklist rss source after exclude match: {} ({})",
+        config_name_or_url(config),
+        config.url,
+        item.title
+    );
+    Ok(())
+}
+
+fn compile_rule_regex(pattern: &str, field_name: &str) -> Result<Option<Regex>> {
+    if pattern.len() >= 2 && pattern.starts_with('/') && pattern.ends_with('/') {
+        return Ok(Some(
+            Regex::new(&pattern[1..pattern.len() - 1])
+                .with_context(|| format!("invalid {field_name} regex: {pattern}"))?,
+        ));
+    }
+    Ok(None)
+}
+
+fn title_matches_rule(title: &str, pattern: &str, regex: Option<&Regex>) -> bool {
+    regex.is_some_and(|regex| regex.is_match(title)) || regex.is_none() && title.contains(pattern)
+}
+
 pub fn chunk_count(len: usize, size: usize) -> usize {
     if len == 0 {
         0
@@ -360,6 +468,14 @@ mod tests {
             magnet: magnet.to_string(),
             description: None,
             content: None,
+        }
+    }
+
+    fn named_config(url: &str) -> RssConfig {
+        RssConfig {
+            name: "test".to_string(),
+            url: url.to_string(),
+            ..RssConfig::default()
         }
     }
 
@@ -393,6 +509,45 @@ mod tests {
         assert_eq!(empty_num, 1);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].magnet, "magnet:?xt=urn:btih:abc123");
+    }
+
+    #[test]
+    fn test_find_blacklist_candidate_matches_regex_rule() {
+        let mut item = magnet_item("magnet:?xt=urn:btih:abc123");
+        item.title = "My Anime FIN".to_string();
+
+        let matched = find_blacklist_candidate(&[item.clone()], Some("/(?i)(fin|end)/")).unwrap();
+        assert_eq!(matched.unwrap().title, item.title);
+    }
+
+    #[test]
+    fn test_filter_blacklisted_configs_skips_matching_rss_url() {
+        let blacklist = BlacklistService::new_in_memory(6).unwrap();
+        let item = MagnetItem {
+            title: "合集".to_string(),
+            link: "https://example.com/item".to_string(),
+            magnet: "magnet:?xt=urn:btih:abc123".to_string(),
+            description: None,
+            content: None,
+        };
+        blacklist
+            .blacklist_rss(
+                "https://example.com/rss?subgroupid=12&bangumiId=2739",
+                &item,
+            )
+            .unwrap();
+
+        let filtered = filter_blacklisted_configs(
+            &blacklist,
+            vec![
+                named_config("https://example.com/rss?bangumiId=2739&subgroupid=12"),
+                named_config("https://example.com/rss?bangumiId=8888"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].url, "https://example.com/rss?bangumiId=8888");
     }
 
     #[tokio::test]

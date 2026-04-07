@@ -13,7 +13,7 @@ mod utils;
 use std::path::PathBuf;
 
 use app::build_app;
-use db::RssService;
+use db::{BlacklistService, RssService};
 use pan115::Pan115Client;
 use request::{ensure_default_config_file, load_default_app_config, Ajax, AppConfig};
 use runner::{RunOptions, TaskRunner};
@@ -76,8 +76,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut service = RssService::open_path(ajax.database_path())?;
+    let blacklist = BlacklistService::open_path(
+        ajax.blacklist_database_path(),
+        ajax.app_config().blacklist.retention_months,
+    )?;
     if let Some(url) = matches.get_one::<String>("url") {
-        if let Err(err) = runner.execute_url(&mut service, url).await {
+        if let Err(err) = runner.execute_url(&mut service, &blacklist, url).await {
             print_error(&err);
             std::process::exit(1);
         }
@@ -85,9 +89,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let result = if matches.get_one::<bool>("concurrent").copied() == Some(true) {
-        runner.execute_all_concurrent(&mut service).await
+        runner
+            .execute_all_concurrent(&mut service, &blacklist)
+            .await
     } else {
-        runner.execute_all(&mut service).await
+        runner.execute_all(&mut service, &blacklist).await
     };
     if let Err(err) = result {
         print_error(&err);

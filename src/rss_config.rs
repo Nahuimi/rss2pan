@@ -71,7 +71,7 @@ fn is_same_rss_url(left: &str, right: &str) -> bool {
     left == right || normalize_rss_url(left) == normalize_rss_url(right)
 }
 
-fn normalize_rss_url(raw: &str) -> String {
+pub(crate) fn normalize_rss_url(raw: &str) -> String {
     let Ok(url) = url::Url::parse(raw) else {
         return raw.to_string();
     };

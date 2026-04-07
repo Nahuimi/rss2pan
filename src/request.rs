@@ -16,6 +16,7 @@ use wreq::{
 const CONFIG_FILE_NAME: &str = "config.toml";
 const DEFAULT_PROXY_ADDRESS: &str = "http://127.0.0.1:10808";
 const DEFAULT_DATABASE_PATH: &str = "db.sqlite";
+const DEFAULT_BLACKLIST_DATABASE_PATH: &str = "blacklist.sqlite";
 const DEFAULT_RSS_PATH: &str = "rss.json";
 const DEFAULT_LOG_LEVEL: &str = "info";
 const USER_AGENT: &str =
@@ -41,6 +42,7 @@ impl Default for ProxyConfig {
 #[serde(default)]
 pub struct PathsConfig {
     pub database: String,
+    pub blacklist: String,
     pub rss: String,
 }
 
@@ -48,6 +50,7 @@ impl Default for PathsConfig {
     fn default() -> Self {
         Self {
             database: DEFAULT_DATABASE_PATH.to_string(),
+            blacklist: DEFAULT_BLACKLIST_DATABASE_PATH.to_string(),
             rss: DEFAULT_RSS_PATH.to_string(),
         }
     }
@@ -67,6 +70,29 @@ impl Default for LogConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct BlacklistConfig {
+    pub exclude: String,
+    pub retention_months: u32,
+}
+
+impl Default for BlacklistConfig {
+    fn default() -> Self {
+        Self {
+            exclude: String::new(),
+            retention_months: 6,
+        }
+    }
+}
+
+impl BlacklistConfig {
+    pub fn exclude_pattern(&self) -> Option<&str> {
+        let exclude = self.exclude.trim();
+        (!exclude.is_empty()).then_some(exclude)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct TemplateConfig {
@@ -81,6 +107,7 @@ pub struct AppConfig {
     pub proxy: ProxyConfig,
     pub paths: PathsConfig,
     pub log: LogConfig,
+    pub blacklist: BlacklistConfig,
     pub cookies: BTreeMap<String, String>,
     pub template: BTreeMap<String, TemplateConfig>,
 }
@@ -116,6 +143,7 @@ impl Default for AppConfig {
             proxy: ProxyConfig::default(),
             paths: PathsConfig::default(),
             log: LogConfig::default(),
+            blacklist: BlacklistConfig::default(),
             cookies,
             template,
         }
@@ -150,6 +178,7 @@ fn default_config_path() -> PathBuf {
 #[derive(Default)]
 struct PathOverrides {
     database: Option<String>,
+    blacklist: Option<String>,
     rss: Option<String>,
 }
 
@@ -168,6 +197,11 @@ fn prepare_config_content_for_parse(content: &str) -> Result<(String, PathOverri
             if let Some(path) = parse_path_override(line, "database")? {
                 overrides.database = Some(path);
                 normalized.push_str("database = \"__RSS2PAN_DATABASE_PATH__\"\n");
+                continue;
+            }
+            if let Some(path) = parse_path_override(line, "blacklist")? {
+                overrides.blacklist = Some(path);
+                normalized.push_str("blacklist = \"__RSS2PAN_BLACKLIST_PATH__\"\n");
                 continue;
             }
             if let Some(path) = parse_path_override(line, "rss")? {
@@ -359,6 +393,12 @@ fn validate_app_config(config: &AppConfig) -> Result<()> {
             SUPPORTED_LOG_LEVELS.join(", ")
         );
     }
+    if config.blacklist.retention_months == 0 {
+        bail!("blacklist.retention_months must be greater than 0");
+    }
+    if let Some(pattern) = config.blacklist.exclude_pattern() {
+        validate_match_pattern("blacklist.exclude", pattern)?;
+    }
 
     let mut seen_domains = BTreeMap::<String, String>::new();
 
@@ -405,6 +445,14 @@ fn validate_app_config(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_match_pattern(field_name: &str, pattern: &str) -> Result<()> {
+    if pattern.len() >= 2 && pattern.starts_with('/') && pattern.ends_with('/') {
+        regex::Regex::new(&pattern[1..pattern.len() - 1])
+            .with_context(|| format!("invalid {field_name} regex: {pattern}"))?;
+    }
+    Ok(())
+}
+
 fn load_app_config(path: &Path) -> Result<AppConfig> {
     if !path.exists() {
         let config = AppConfig::default();
@@ -423,6 +471,9 @@ fn load_app_config(path: &Path) -> Result<AppConfig> {
         .with_context(|| format!("parse {} failed", path.display()))?;
     if let Some(database) = path_overrides.database {
         config.paths.database = database;
+    }
+    if let Some(blacklist) = path_overrides.blacklist {
+        config.paths.blacklist = blacklist;
     }
     if let Some(rss) = path_overrides.rss {
         config.paths.rss = rss;
@@ -589,6 +640,10 @@ impl Ajax {
 
     pub fn database_path(&self) -> PathBuf {
         PathBuf::from(self.app_config().paths.database)
+    }
+
+    pub fn blacklist_database_path(&self) -> PathBuf {
+        PathBuf::from(self.app_config().paths.blacklist)
     }
 
     pub fn resolve_site(&self, host: &str) -> ResolvedSiteConfig {
@@ -759,9 +814,12 @@ mod tests {
         let content = default_config_toml().unwrap();
         assert!(content.contains("[paths]"));
         assert!(content.contains("database = \"db.sqlite\""));
+        assert!(content.contains("blacklist = \"blacklist.sqlite\""));
         assert!(content.contains("rss = \"rss.json\""));
         assert!(content.contains("[log]"));
         assert!(content.contains("level = \"info\""));
+        assert!(content.contains("[blacklist]"));
+        assert!(content.contains("retention_months = 6"));
     }
 
     #[test]
@@ -776,7 +834,7 @@ mod tests {
     fn test_windows_path_with_unescaped_backslashes_is_accepted() {
         let path = write_temp_config(
             "windows-unescaped-path",
-            "[paths]\ndatabase = \"D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\db.sqlite\"\nrss = \"D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\rss.json\"\n\n[template.mikanani]\ndomains = [\"mikanani.me\"]\n",
+            "[paths]\ndatabase = \"D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\db.sqlite\"\nblacklist = \"D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\blacklist.sqlite\"\nrss = \"D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\rss.json\"\n\n[template.mikanani]\ndomains = [\"mikanani.me\"]\n",
         );
         let ajax = Ajax::with_config_path(None, path.clone()).unwrap();
         let config = ajax.app_config();
@@ -784,6 +842,10 @@ mod tests {
         assert_eq!(
             config.paths.database,
             "D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\db.sqlite"
+        );
+        assert_eq!(
+            config.paths.blacklist,
+            "D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\blacklist.sqlite"
         );
         assert_eq!(
             config.paths.rss,
@@ -797,13 +859,17 @@ mod tests {
     fn test_windows_path_with_literal_string_is_accepted() {
         let path = write_temp_config(
             "windows-literal-path",
-            "[paths]\ndatabase = 'D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\db.sqlite'\n\n[template.mikanani]\ndomains = [\"mikanani.me\"]\n",
+            "[paths]\ndatabase = 'D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\db.sqlite'\nblacklist = 'D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\blacklist.sqlite'\n\n[template.mikanani]\ndomains = [\"mikanani.me\"]\n",
         );
         let ajax = Ajax::with_config_path(None, path.clone()).unwrap();
 
         assert_eq!(
             ajax.app_config().paths.database,
             "D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\db.sqlite"
+        );
+        assert_eq!(
+            ajax.app_config().paths.blacklist,
+            "D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\blacklist.sqlite"
         );
 
         remove_temp_file(&path);
@@ -912,6 +978,28 @@ domains = ["mikanani.me"]
             Err(err) => assert!(err
                 .to_string()
                 .contains("log.level must be one of: off, error, warn, info, debug, trace")),
+        }
+
+        remove_temp_file(&path);
+    }
+
+    #[test]
+    fn test_invalid_blacklist_regex_is_rejected() {
+        let path = write_temp_config(
+            "invalid-blacklist-regex",
+            r#"[blacklist]
+exclude = "/(abc/"
+
+[template.mikanani]
+domains = ["mikanani.me"]
+"#,
+        );
+
+        match Ajax::with_config_path(None, path.clone()) {
+            Ok(_) => panic!("expected invalid blacklist regex config to fail"),
+            Err(err) => assert!(err
+                .to_string()
+                .contains("invalid blacklist.exclude regex: /(abc/")),
         }
 
         remove_temp_file(&path);

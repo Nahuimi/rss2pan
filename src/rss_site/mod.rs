@@ -440,10 +440,14 @@ pub async fn get_magnetitem_list(
 
     let channel = get_feed(ajax, &config.url).await?;
     let regex = match config.filter.as_deref() {
-        Some(pattern) if pattern.starts_with('/') && pattern.ends_with('/') => Some(
-            Regex::new(&pattern[1..pattern.len() - 1])
-                .with_context(|| format!("invalid regex filter: {}", pattern))?,
-        ),
+        Some(pattern)
+            if pattern.len() >= 2 && pattern.starts_with('/') && pattern.ends_with('/') =>
+        {
+            Some(
+                Regex::new(&pattern[1..pattern.len() - 1])
+                    .with_context(|| format!("invalid regex filter: {}", pattern))?,
+            )
+        }
         _ => None,
     };
 
