@@ -3,12 +3,16 @@ use std::{
     path::Path,
 };
 
-use chrono::prelude::*;
-
 use anyhow::{bail, Result};
 use rusqlite::{params, params_from_iter, Connection, Error};
 
-use crate::{rss_config::normalize_rss_url, rss_site::MagnetItem, utils::canonicalize_magnet};
+use crate::{
+    rss_config::normalize_rss_url,
+    rss_site::MagnetItem,
+    utils::{
+        canonicalize_magnet, current_db_timestamp, db_timestamp_months_ago, normalize_db_timestamp,
+    },
+};
 
 const EXISTING_MAGNETS_CHUNK_SIZE: usize = 500;
 const RSS_ITEMS_MAGNET_INDEX: &str = "idx_rss_items_magnet";
@@ -43,6 +47,8 @@ impl RssService {
         )?;
         let mut service = Self { conn };
         service.migrate_rss_items()?;
+        service.normalize_table_timestamps("rss_items")?;
+        service.normalize_table_timestamps("sites_status")?;
         Ok(service)
     }
 
@@ -51,8 +57,7 @@ impl RssService {
             return Ok(());
         }
 
-        let now: DateTime<Utc> = Utc::now();
-        let now = now.to_string();
+        let now = current_db_timestamp();
         let done = u8::from(done).to_string();
         let tx = self.conn.transaction()?;
         {
@@ -190,16 +195,19 @@ impl RssService {
             "abnormalOp" => "abnormalOp",
             _ => bail!("invalid status column: {key}"),
         };
-        let stmt = format!("UPDATE sites_status SET {column} = ?1 WHERE name = ?2");
-        let num = self.conn.execute(&stmt, params![u8::from(value), host])?;
+        let stmt = format!("UPDATE sites_status SET {column} = ?1, updatedAt = ?3 WHERE name = ?2");
+        let num = self.conn.execute(
+            &stmt,
+            params![u8::from(value), host, current_db_timestamp()],
+        )?;
         Ok(num)
     }
 
     #[allow(dead_code)]
     pub fn reset_status(&self, name: &str) -> Result<usize> {
         let num = self.conn.execute(
-            "UPDATE sites_status SET abnormalOp = 0,needLogin = 0 WHERE name = ?1",
-            [name],
+            "UPDATE sites_status SET abnormalOp = 0,needLogin = 0,updatedAt = ?2 WHERE name = ?1",
+            params![name, current_db_timestamp()],
         )?;
         Ok(num)
     }
@@ -215,15 +223,19 @@ impl RssService {
             Ok((0, 0)) => Ok(true),
             Ok(_) => Ok(false),
             Err(Error::QueryReturnedNoRows) => {
-                let now: DateTime<Utc> = Utc::now();
+                let now = current_db_timestamp();
                 self.conn.execute(
                     "INSERT INTO sites_status (name,`createdAt`,`updatedAt`,`needLogin`, `abnormalOp`) VALUES (?,?,?,0,0)",
-                    [name, &now.to_string(), &now.to_string()],
+                    [name, now.as_str(), now.as_str()],
                 )?;
                 Ok(true)
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    fn normalize_table_timestamps(&mut self, table: &str) -> Result<()> {
+        normalize_table_timestamps(&mut self.conn, table)
     }
 }
 
@@ -249,14 +261,14 @@ impl BlacklistService {
         let mut service = Self { conn };
         service.migrate_blacklist_schema()?;
         service.migrate_blacklist_items()?;
+        service.normalize_table_timestamps()?;
         Ok(service)
     }
 
     pub fn prune_expired(&mut self, retention_months: u32) -> Result<usize> {
-        let modifier = format!("-{retention_months} months");
         let rows = self.conn.execute(
-            "DELETE FROM rss_blacklist WHERE datetime(updatedAt) < datetime('now', ?1)",
-            [modifier.as_str()],
+            "DELETE FROM rss_blacklist WHERE updatedAt < ?1",
+            params![db_timestamp_months_ago(retention_months)],
         )?;
         Ok(rows)
     }
@@ -272,7 +284,7 @@ impl BlacklistService {
     }
 
     pub fn blacklist_rss(&self, rss_url: &str, item: &MagnetItem) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
+        let now = current_db_timestamp();
         let rss_link = normalize_rss_url(rss_url);
         self.conn.execute(
             "INSERT INTO rss_blacklist (`link`,`title`,`rssLink`,`createdAt`,`updatedAt`) VALUES (?1,?2,?3,?4,?4)
@@ -354,6 +366,44 @@ impl BlacklistService {
         tx.commit()?;
         Ok(())
     }
+
+    fn normalize_table_timestamps(&mut self) -> Result<()> {
+        normalize_table_timestamps(&mut self.conn, "rss_blacklist")
+    }
+}
+
+fn normalize_table_timestamps(conn: &mut Connection, table: &str) -> Result<()> {
+    let tx = conn.transaction()?;
+    let rows = {
+        let mut stmt = tx.prepare(&format!(
+            "SELECT id, createdAt, updatedAt FROM {table} ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    for (id, created_at, updated_at) in rows {
+        let normalized_created = normalize_db_timestamp(&created_at)
+            .unwrap_or_else(|| created_at.clone());
+        let normalized_updated = normalize_db_timestamp(&updated_at)
+            .unwrap_or_else(|| updated_at.clone());
+        if normalized_created == created_at && normalized_updated == updated_at {
+            continue;
+        }
+        tx.execute(
+            &format!("UPDATE {table} SET createdAt = ?1, updatedAt = ?2 WHERE id = ?3"),
+            params![normalized_created, normalized_updated, id],
+        )?;
+    }
+
+    tx.commit()?;
+    Ok(())
 }
 
 fn repeat_vars(count: usize) -> String {
@@ -472,6 +522,47 @@ mod tests {
         assert_eq!(count, 1);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_rss_service_normalizes_legacy_timestamp_formats() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE rss_items (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `link` VARCHAR(255), `title` VARCHAR(255), `guid` VARCHAR(255), `pubDate` DATETIME, `creator` VARCHAR(255), `summary` TEXT, `content` VARCHAR(255), `isoDate` DATETIME, `categories` VARCHAR(255), `contentSnippet` VARCHAR(255), `done` TINYINT(1) DEFAULT 0, `magnet` TEXT NOT NULL, `createdAt` DATETIME NOT NULL, `updatedAt` DATETIME NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE sites_status (`id` INTEGER PRIMARY KEY AUTOINCREMENT, `name` VARCHAR(255), `needLogin` TINYINT(1), `abnormalOp` TINYINT(1), `createdAt` DATETIME NOT NULL, `updatedAt` DATETIME NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rss_items (`link`,`title`,`content`,`magnet`,`done`,`createdAt`,`updatedAt`) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                "https://example.com/item",
+                "test",
+                "",
+                magnet("abc123"),
+                "1",
+                "2026-04-07T03:13:16.728787900+00:00",
+                "2026-04-05 07：57：40.658769500 UTC",
+            ],
+        )
+        .unwrap();
+
+        let service = RssService::from_connection(conn).unwrap();
+        let timestamps: (String, String) = service
+            .conn
+            .query_row(
+                "SELECT createdAt, updatedAt FROM rss_items WHERE magnet = ?1",
+                [magnet("abc123")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(timestamps.0, "2026-04-07 11：13");
+        assert_eq!(timestamps.1, "2026-04-05 15：57");
     }
 
     #[test]

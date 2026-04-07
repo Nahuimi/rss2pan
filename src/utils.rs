@@ -6,10 +6,15 @@ use std::{
     process::Command,
 };
 
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
+
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::io::ErrorKind;
 
 use url::Url;
+
+const DB_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H：%M";
+const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 
 pub fn canonicalize_magnet(raw: &str) -> String {
     let trimmed = raw.trim();
@@ -118,9 +123,138 @@ pub fn open_qrcode_image(path: &Path) -> anyhow::Result<()> {
     }
 }
 
+pub fn current_db_timestamp() -> String {
+    format_db_timestamp(Utc::now())
+}
+
+pub fn format_db_timestamp<Tz: TimeZone>(datetime: DateTime<Tz>) -> String {
+    datetime
+        .with_timezone(&beijing_offset())
+        .format(DB_TIMESTAMP_FORMAT)
+        .to_string()
+}
+
+pub fn normalize_db_timestamp(raw: &str) -> Option<String> {
+    parse_db_timestamp(raw).map(format_db_timestamp)
+}
+
+pub fn db_timestamp_months_ago(months: u32) -> String {
+    format_db_timestamp(subtract_months(
+        Utc::now().with_timezone(&beijing_offset()),
+        months,
+    ))
+}
+
+fn parse_db_timestamp(raw: &str) -> Option<DateTime<FixedOffset>> {
+    let normalized = normalize_db_timestamp_input(raw);
+    for candidate in timestamp_parse_candidates(&normalized) {
+        if let Ok(datetime) = DateTime::parse_from_rfc3339(&candidate) {
+            return Some(datetime);
+        }
+        for fmt in [
+            "%Y-%m-%d %H:%M:%S%.f%:z",
+            "%Y-%m-%d %H:%M:%S%:z",
+            "%Y-%m-%d %H:%M%:z",
+            "%Y-%m-%d %H:%M:%S%.f %:z",
+            "%Y-%m-%d %H:%M:%S %:z",
+            "%Y-%m-%d %H:%M %:z",
+        ] {
+            if let Ok(datetime) = DateTime::parse_from_str(&candidate, fmt) {
+                return Some(datetime);
+            }
+        }
+        for fmt in [
+            "%Y-%m-%d %H:%M:%S%.f",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+        ] {
+            if let Ok(datetime) = NaiveDateTime::parse_from_str(&candidate, fmt) {
+                if let Some(datetime) = beijing_offset().from_local_datetime(&datetime).single() {
+                    return Some(datetime);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn normalize_db_timestamp_input(raw: &str) -> String {
+    let mut normalized = raw.trim().replace('：', ":").replace('\u{3000}', " ");
+    normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.len() > 10 && normalized.as_bytes()[10].is_ascii_digit() {
+        normalized.insert(10, ' ');
+    }
+    normalized
+}
+
+fn timestamp_parse_candidates(normalized: &str) -> Vec<String> {
+    let mut candidates = vec![normalized.to_string()];
+
+    if normalized.ends_with(" UTC") {
+        candidates.push(format!("{}+00:00", normalized.trim_end_matches(" UTC")));
+    }
+
+    if normalized.len() > 10 {
+        match normalized.as_bytes()[10] {
+            b' ' => {
+                let mut rfc3339 = normalized.to_string();
+                rfc3339.replace_range(10..11, "T");
+                candidates.push(rfc3339);
+            }
+            b'T' => {
+                let mut spaced = normalized.to_string();
+                spaced.replace_range(10..11, " ");
+                candidates.push(spaced);
+            }
+            _ => {}
+        }
+    }
+
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn subtract_months(datetime: DateTime<FixedOffset>, months: u32) -> DateTime<FixedOffset> {
+    let total_months = i64::from(datetime.year()) * 12 + i64::from(datetime.month0());
+    let adjusted_months = total_months - i64::from(months);
+    let year = adjusted_months.div_euclid(12) as i32;
+    let month0 = adjusted_months.rem_euclid(12) as u32;
+    let month = month0 + 1;
+    let day = datetime.day().min(last_day_of_month(year, month));
+    let naive = NaiveDate::from_ymd_opt(year, month, day)
+        .and_then(|date| date.and_hms_opt(datetime.hour(), datetime.minute(), 0))
+        .expect("valid Beijing timestamp");
+    beijing_offset()
+        .from_local_datetime(&naive)
+        .single()
+        .expect("valid Beijing timestamp")
+}
+
+fn last_day_of_month(year: i32, month: u32) -> u32 {
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let first_day_next_month =
+        NaiveDate::from_ymd_opt(next_year, next_month, 1).expect("valid first day of month");
+    first_day_next_month
+        .pred_opt()
+        .expect("previous day exists")
+        .day()
+}
+
+fn beijing_offset() -> FixedOffset {
+    FixedOffset::east_opt(BEIJING_UTC_OFFSET_SECONDS).expect("valid Beijing offset")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::canonicalize_magnet;
+    use super::{
+        canonicalize_magnet, db_timestamp_months_ago, format_db_timestamp, normalize_db_timestamp,
+    };
+    use chrono::{TimeZone, Utc};
 
     #[test]
     fn test_canonicalize_magnet_strips_extra_params_and_lowercases_hash() {
@@ -136,5 +270,34 @@ mod tests {
             canonicalize_magnet(" https://example.com/file.torrent "),
             "https://example.com/file.torrent"
         );
+    }
+
+    #[test]
+    fn test_normalize_db_timestamp_accepts_mixed_legacy_formats() {
+        assert_eq!(
+            normalize_db_timestamp("2026-04-07T03:13:16.728787900+00:00").as_deref(),
+            Some("2026-04-07 11：13")
+        );
+        assert_eq!(
+            normalize_db_timestamp("2024-05-2115:18:14.3284712+08:00").as_deref(),
+            Some("2024-05-21 15：18")
+        );
+        assert_eq!(
+            normalize_db_timestamp("2026-04-05 07：57：40.658769500 UTC").as_deref(),
+            Some("2026-04-05 15：57")
+        );
+    }
+
+    #[test]
+    fn test_format_db_timestamp_uses_beijing_time_and_fullwidth_colon() {
+        let datetime = Utc.with_ymd_and_hms(2026, 4, 5, 7, 57, 40).unwrap();
+        assert_eq!(format_db_timestamp(datetime), "2026-04-05 15：57");
+    }
+
+    #[test]
+    fn test_db_timestamp_months_ago_keeps_db_format() {
+        let timestamp = db_timestamp_months_ago(6);
+        assert_eq!(timestamp.len(), "2026-04-05 07：57".len());
+        assert!(timestamp.contains('：'));
     }
 }
