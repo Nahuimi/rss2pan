@@ -389,10 +389,10 @@ fn normalize_table_timestamps(conn: &mut Connection, table: &str) -> Result<()> 
     };
 
     for (id, created_at, updated_at) in rows {
-        let normalized_created = normalize_db_timestamp(&created_at)
-            .unwrap_or_else(|| created_at.clone());
-        let normalized_updated = normalize_db_timestamp(&updated_at)
-            .unwrap_or_else(|| updated_at.clone());
+        let normalized_created =
+            normalize_db_timestamp(&created_at).unwrap_or_else(|| created_at.clone());
+        let normalized_updated =
+            normalize_db_timestamp(&updated_at).unwrap_or_else(|| updated_at.clone());
         if normalized_created == created_at && normalized_updated == updated_at {
             continue;
         }
