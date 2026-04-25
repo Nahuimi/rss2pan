@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::ArgMatches;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use wreq::{
     header::{HeaderMap, HeaderValue},
     Client, Method, RequestBuilder,
@@ -23,6 +23,38 @@ const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 const SUPPORTED_TEMPLATE_PARSERS: &[&str] = &["acgnx", "dmhy", "mikanani", "nyaa", "rsshub"];
 const SUPPORTED_LOG_LEVELS: &[&str] = &["off", "error", "warn", "info", "debug", "trace"];
+
+fn default_rss_paths() -> Vec<String> {
+    vec![DEFAULT_RSS_PATH.to_string()]
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RssPathsValue {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+fn deserialize_rss_paths<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match RssPathsValue::deserialize(deserializer)? {
+        RssPathsValue::Single(path) => vec![path],
+        RssPathsValue::Multiple(paths) => paths,
+    })
+}
+
+fn serialize_rss_paths<S>(paths: &[String], serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if let [path] = paths {
+        serializer.serialize_str(path)
+    } else {
+        paths.serialize(serializer)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -43,7 +75,12 @@ impl Default for ProxyConfig {
 pub struct PathsConfig {
     pub database: String,
     pub blacklist: String,
-    pub rss: String,
+    #[serde(
+        default = "default_rss_paths",
+        deserialize_with = "deserialize_rss_paths",
+        serialize_with = "serialize_rss_paths"
+    )]
+    pub rss: Vec<String>,
 }
 
 impl Default for PathsConfig {
@@ -51,7 +88,7 @@ impl Default for PathsConfig {
         Self {
             database: DEFAULT_DATABASE_PATH.to_string(),
             blacklist: DEFAULT_BLACKLIST_DATABASE_PATH.to_string(),
-            rss: DEFAULT_RSS_PATH.to_string(),
+            rss: default_rss_paths(),
         }
     }
 }
@@ -179,7 +216,7 @@ fn default_config_path() -> PathBuf {
 struct PathOverrides {
     database: Option<String>,
     blacklist: Option<String>,
-    rss: Option<String>,
+    rss: Option<Vec<String>>,
 }
 
 fn prepare_config_content_for_parse(content: &str) -> Result<(String, PathOverrides)> {
@@ -204,8 +241,8 @@ fn prepare_config_content_for_parse(content: &str) -> Result<(String, PathOverri
                 normalized.push_str("blacklist = \"__RSS2PAN_BLACKLIST_PATH__\"\n");
                 continue;
             }
-            if let Some(path) = parse_path_override(line, "rss")? {
-                overrides.rss = Some(path);
+            if let Some(paths) = parse_rss_path_override(line)? {
+                overrides.rss = Some(paths);
                 normalized.push_str("rss = \"__RSS2PAN_RSS_PATH__\"\n");
                 continue;
             }
@@ -219,6 +256,20 @@ fn prepare_config_content_for_parse(content: &str) -> Result<(String, PathOverri
 }
 
 fn parse_path_override(line: &str, key: &str) -> Result<Option<String>> {
+    let Some(paths) = parse_path_overrides(line, key)? else {
+        return Ok(None);
+    };
+    match paths.as_slice() {
+        [path] => Ok(Some(path.clone())),
+        _ => bail!("invalid [paths].{key} value"),
+    }
+}
+
+fn parse_rss_path_override(line: &str) -> Result<Option<Vec<String>>> {
+    parse_path_overrides(line, "rss")
+}
+
+fn parse_path_overrides(line: &str, key: &str) -> Result<Option<Vec<String>>> {
     let trimmed = line.trim_start();
     let Some(rest) = trimmed.strip_prefix(key) else {
         return Ok(None);
@@ -227,14 +278,25 @@ fn parse_path_override(line: &str, key: &str) -> Result<Option<String>> {
         return Ok(None);
     };
     let rest = rest.trim_start();
-    let Some((value, tail)) = parse_path_value(rest)? else {
+    let Some((paths, tail)) = parse_path_values(rest)? else {
         return Ok(None);
     };
     let tail = tail.trim_start();
     if !tail.is_empty() && !tail.starts_with('#') {
         bail!("invalid [paths].{key} value");
     }
-    Ok(Some(value))
+    Ok(Some(paths))
+}
+
+fn parse_path_values(input: &str) -> Result<Option<(Vec<String>, &str)>> {
+    match input.chars().next() {
+        Some('"') | Some('\'') => {
+            let (value, tail) = parse_path_value(input)?.expect("quoted paths must parse");
+            Ok(Some((vec![value], tail)))
+        }
+        Some('[') => Ok(Some(parse_path_array_value(input)?)),
+        _ => Ok(None),
+    }
 }
 
 fn parse_path_value(input: &str) -> Result<Option<(String, &str)>> {
@@ -242,6 +304,33 @@ fn parse_path_value(input: &str) -> Result<Option<(String, &str)>> {
         Some('"') => Ok(Some(parse_basic_path_value(input)?)),
         Some('\'') => Ok(Some(parse_literal_path_value(input)?)),
         _ => Ok(None),
+    }
+}
+
+fn parse_path_array_value(input: &str) -> Result<(Vec<String>, &str)> {
+    let mut rest = &input[1..];
+    let mut values = Vec::new();
+
+    loop {
+        rest = rest.trim_start();
+        if let Some(tail) = rest.strip_prefix(']') {
+            return Ok((values, tail));
+        }
+
+        let Some((value, tail)) = parse_path_value(rest)? else {
+            bail!("invalid quoted path array value");
+        };
+        values.push(value);
+
+        rest = tail.trim_start();
+        if let Some(tail) = rest.strip_prefix(',') {
+            rest = tail;
+            continue;
+        }
+        if let Some(tail) = rest.strip_prefix(']') {
+            return Ok((values, tail));
+        }
+        bail!("invalid quoted path array value");
     }
 }
 
@@ -387,6 +476,12 @@ fn validate_legacy_config_shape(raw: &toml::Value) -> Result<()> {
 }
 
 fn validate_app_config(config: &AppConfig) -> Result<()> {
+    if config.paths.rss.is_empty() {
+        bail!("paths.rss must not be empty");
+    }
+    if config.paths.rss.iter().any(|path| path.trim().is_empty()) {
+        bail!("paths.rss must not contain empty paths");
+    }
     if !SUPPORTED_LOG_LEVELS.contains(&config.log.level.as_str()) {
         bail!(
             "log.level must be one of: {}",
@@ -849,7 +944,23 @@ mod tests {
         );
         assert_eq!(
             config.paths.rss,
-            "D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\rss.json"
+            vec!["D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\rss.json".to_string()]
+        );
+
+        remove_temp_file(&path);
+    }
+
+    #[test]
+    fn test_multiple_rss_paths_are_accepted() {
+        let path = write_temp_config(
+            "multiple-rss-paths",
+            "[paths]\nrss = [\"rss.json\", \"rss-2.json\"]\n\n[template.mikanani]\ndomains = [\"mikanani.me\"]\n",
+        );
+        let ajax = Ajax::with_config_path(None, path.clone()).unwrap();
+
+        assert_eq!(
+            ajax.app_config().paths.rss,
+            vec!["rss.json".to_string(), "rss-2.json".to_string()]
         );
 
         remove_temp_file(&path);

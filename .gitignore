@@ -2,3 +2,5 @@
 /.idea
 db.sqlite
 .cookies
+AGENTS.md
+CLAUDE.md

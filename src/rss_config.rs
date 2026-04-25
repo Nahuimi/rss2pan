@@ -1,4 +1,8 @@
-use std::{fs, path::PathBuf};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
@@ -15,18 +19,20 @@ pub struct RssConfig {
     pub expiration: Option<u8>,
 }
 
-fn default_rss_path() -> PathBuf {
-    PathBuf::from(RSS_FILE_NAME)
+fn default_rss_paths() -> Vec<PathBuf> {
+    vec![PathBuf::from(RSS_FILE_NAME)]
 }
 
-fn resolve_rss_path(path: Option<&PathBuf>) -> PathBuf {
-    path.cloned().unwrap_or_else(default_rss_path)
+fn resolve_rss_paths(paths: Option<&[PathBuf]>) -> Vec<PathBuf> {
+    match paths {
+        Some(paths) if !paths.is_empty() => paths.to_vec(),
+        _ => default_rss_paths(),
+    }
 }
 
-pub fn get_rss_list(path: Option<&PathBuf>) -> anyhow::Result<Vec<RssConfig>> {
-    let path = resolve_rss_path(path);
+fn read_rss_list(path: &Path) -> anyhow::Result<Vec<RssConfig>> {
     let content =
-        fs::read_to_string(&path).with_context(|| format!("read {} failed", path.display()))?;
+        fs::read_to_string(path).with_context(|| format!("read {} failed", path.display()))?;
     let raw: serde_json::Value = serde_json::from_str(&content)
         .with_context(|| format!("parse {} failed", path.display()))?;
 
@@ -47,13 +53,30 @@ pub fn get_rss_list(path: Option<&PathBuf>) -> anyhow::Result<Vec<RssConfig>> {
     serde_json::from_value(raw).with_context(|| format!("parse {} failed", path.display()))
 }
 
-pub fn get_rss_config_by_url(path: Option<&PathBuf>, url: &str) -> anyhow::Result<RssConfig> {
-    let path = resolve_rss_path(path);
-    if !path.exists() {
+pub fn get_rss_list(paths: Option<&[PathBuf]>) -> anyhow::Result<Vec<RssConfig>> {
+    let mut merged = Vec::<Option<RssConfig>>::new();
+    let mut latest_index = HashMap::<String, usize>::new();
+
+    for path in resolve_rss_paths(paths) {
+        for config in read_rss_list(&path)? {
+            let key = normalize_rss_url(&config.url);
+            if let Some(previous) = latest_index.insert(key, merged.len()) {
+                merged[previous] = None;
+            }
+            merged.push(Some(config));
+        }
+    }
+
+    Ok(merged.into_iter().flatten().collect())
+}
+
+pub fn get_rss_config_by_url(paths: Option<&[PathBuf]>, url: &str) -> anyhow::Result<RssConfig> {
+    let paths = resolve_rss_paths(paths);
+    if paths.iter().all(|path| !path.exists()) {
         return Ok(default_rss_config(url));
     }
 
-    let config = get_rss_list(Some(&path))?
+    let config = get_rss_list(Some(paths.as_slice()))?
         .into_iter()
         .find(|config| is_same_rss_url(&config.url, url));
 
@@ -148,7 +171,7 @@ mod tests {
         .unwrap();
 
         let config = get_rss_config_by_url(
-            Some(&rss_path),
+            Some(std::slice::from_ref(&rss_path)),
             "https://mikanime.tv/RSS/Bangumi?bangumiId=2739&subgroupid=12",
         )
         .unwrap();
@@ -160,11 +183,97 @@ mod tests {
     #[test]
     fn test_get_rss_config_by_url_returns_default_when_file_missing() {
         let rss_path = temp_path("missing");
-        let config = get_rss_config_by_url(Some(&rss_path), "https://example.com/rss").unwrap();
+        let config = get_rss_config_by_url(
+            Some(std::slice::from_ref(&rss_path)),
+            "https://example.com/rss",
+        )
+        .unwrap();
 
         assert_eq!(config.url, "https://example.com/rss");
         assert!(config.name.is_empty());
         assert!(config.cid.is_none());
+    }
+
+    #[test]
+    fn test_get_rss_list_merges_multiple_files_and_keeps_later_duplicates() {
+        let first_path = temp_path("first");
+        let second_path = temp_path("second");
+        fs::write(
+            &first_path,
+            r#"[
+  {
+    "name": "first",
+    "url": "https://example.com/rss?a=1&b=2"
+  },
+  {
+    "name": "keep",
+    "url": "https://example.com/other"
+  }
+]"#,
+        )
+        .unwrap();
+        fs::write(
+            &second_path,
+            r#"[
+  {
+    "name": "second",
+    "url": "https://example.com/rss?b=2&a=1"
+  },
+  {
+    "name": "last",
+    "url": "https://example.com/last"
+  }
+]"#,
+        )
+        .unwrap();
+
+        let configs = get_rss_list(Some(&[first_path.clone(), second_path.clone()])).unwrap();
+        let names = configs
+            .into_iter()
+            .map(|config| config.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["keep", "second", "last"]);
+
+        remove_temp_file(&first_path);
+        remove_temp_file(&second_path);
+    }
+
+    #[test]
+    fn test_get_rss_config_by_url_prefers_later_duplicate_from_multiple_files() {
+        let first_path = temp_path("lookup-first");
+        let second_path = temp_path("lookup-second");
+        fs::write(
+            &first_path,
+            r#"[
+  {
+    "name": "first",
+    "url": "https://example.com/rss?a=1&b=2"
+  }
+]"#,
+        )
+        .unwrap();
+        fs::write(
+            &second_path,
+            r#"[
+  {
+    "name": "second",
+    "url": "https://example.com/rss?b=2&a=1"
+  }
+]"#,
+        )
+        .unwrap();
+
+        let config = get_rss_config_by_url(
+            Some(&[first_path.clone(), second_path.clone()]),
+            "https://example.com/rss?a=1&b=2",
+        )
+        .unwrap();
+
+        assert_eq!(config.name, "second");
+
+        remove_temp_file(&first_path);
+        remove_temp_file(&second_path);
     }
 
     #[test]
@@ -183,7 +292,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = get_rss_list(Some(&rss_path)).unwrap_err();
+        let err = get_rss_list(Some(std::slice::from_ref(&rss_path))).unwrap_err();
         assert!(err
             .to_string()
             .contains("format changed: use a flat array instead of host-keyed object"));

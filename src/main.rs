@@ -28,11 +28,11 @@ async fn main() -> anyhow::Result<()> {
     let matches = build_app().get_matches();
     let ajax = Ajax::from_matches(&matches)?;
     let pan115 = Pan115Client::new(ajax.clone());
-    let rss_path = Some(resolve_rss_path(&matches, &app_config));
+    let rss_paths = Some(resolve_rss_paths(&matches, &app_config));
     let runner = TaskRunner::new(
         pan115.clone(),
         ajax.clone(),
-        rss_path,
+        rss_paths,
         RunOptions::from_matches(&matches),
     );
     if let Some(qrcode_app) = forced_qrcode_app(&matches) {
@@ -127,11 +127,12 @@ fn init_logger(default_level: &str) {
     builder.init();
 }
 
-fn resolve_rss_path(matches: &clap::ArgMatches, config: &AppConfig) -> PathBuf {
+fn resolve_rss_paths(matches: &clap::ArgMatches, config: &AppConfig) -> Vec<PathBuf> {
     matches
         .get_one::<PathBuf>("rss")
         .cloned()
-        .unwrap_or_else(|| PathBuf::from(&config.paths.rss))
+        .map(|path| vec![path])
+        .unwrap_or_else(|| config.paths.rss.iter().map(PathBuf::from).collect())
 }
 
 fn forced_qrcode_app(matches: &clap::ArgMatches) -> Option<&str> {
@@ -154,28 +155,28 @@ mod tests {
     use crate::request::AppConfig;
 
     #[test]
-    fn test_resolve_rss_path_prefers_cli_over_config() {
+    fn test_resolve_rss_paths_prefers_cli_over_config() {
         let matches = build_app()
             .try_get_matches_from(["rss2pan", "--rss", "custom.json"])
             .unwrap();
         let mut config = AppConfig::default();
-        config.paths.rss = "config.json".to_string();
+        config.paths.rss = vec!["config.json".to_string(), "config-2.json".to_string()];
 
         assert_eq!(
-            resolve_rss_path(&matches, &config),
-            PathBuf::from("custom.json")
+            resolve_rss_paths(&matches, &config),
+            vec![PathBuf::from("custom.json")]
         );
     }
 
     #[test]
-    fn test_resolve_rss_path_uses_config_default_without_cli() {
+    fn test_resolve_rss_paths_uses_config_default_without_cli() {
         let matches = build_app().try_get_matches_from(["rss2pan"]).unwrap();
         let mut config = AppConfig::default();
-        config.paths.rss = "config.json".to_string();
+        config.paths.rss = vec!["config.json".to_string(), "config-2.json".to_string()];
 
         assert_eq!(
-            resolve_rss_path(&matches, &config),
-            PathBuf::from("config.json")
+            resolve_rss_paths(&matches, &config),
+            vec![PathBuf::from("config.json"), PathBuf::from("config-2.json")]
         );
     }
 

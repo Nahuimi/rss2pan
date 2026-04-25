@@ -56,7 +56,7 @@ impl RunOptions {
 pub struct TaskRunner {
     pan115: Pan115Client,
     ajax: Ajax,
-    rss_path: Option<PathBuf>,
+    rss_paths: Option<Vec<PathBuf>>,
     options: RunOptions,
 }
 
@@ -64,13 +64,13 @@ impl TaskRunner {
     pub fn new(
         pan115: Pan115Client,
         ajax: Ajax,
-        rss_path: Option<PathBuf>,
+        rss_paths: Option<Vec<PathBuf>>,
         options: RunOptions,
     ) -> Self {
         Self {
             pan115,
             ajax,
-            rss_path,
+            rss_paths,
             options,
         }
     }
@@ -85,7 +85,7 @@ impl TaskRunner {
         blacklist: &BlacklistService,
         url: &str,
     ) -> Result<()> {
-        let config = get_rss_config_by_url(self.rss_path.as_ref(), url)?;
+        let config = get_rss_config_by_url(self.rss_paths.as_deref(), url)?;
         if should_skip_blacklisted_rss(blacklist, &config)? {
             return Ok(());
         }
@@ -100,7 +100,8 @@ impl TaskRunner {
         service: &mut RssService,
         blacklist: &BlacklistService,
     ) -> Result<()> {
-        let configs = filter_blacklisted_configs(blacklist, get_rss_list(self.rss_path.as_ref())?)?;
+        let configs =
+            filter_blacklisted_configs(blacklist, get_rss_list(self.rss_paths.as_deref())?)?;
         if configs.is_empty() {
             return Ok(());
         }
@@ -129,7 +130,8 @@ impl TaskRunner {
         service: &mut RssService,
         blacklist: &BlacklistService,
     ) -> Result<()> {
-        let configs = filter_blacklisted_configs(blacklist, get_rss_list(self.rss_path.as_ref())?)?;
+        let configs =
+            filter_blacklisted_configs(blacklist, get_rss_list(self.rss_paths.as_deref())?)?;
         if configs.is_empty() {
             return Ok(());
         }
