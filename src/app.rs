@@ -46,6 +46,11 @@ pub fn build_app() -> Command {
             arg!(--"clear-task-type" [clear_task_type] "clear offline task type: 1-6")
                 .value_parser(value_parser!(u8).range(1..=6)),
         )
+        .arg(
+            arg!(--"retry-failed" "delete failed 115 offline tasks and add them back again")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("clear-task-type"),
+        )
         .subcommand(
             Command::new("magnet")
                 .about("magnet to pan")
@@ -156,4 +161,18 @@ fn t_new_flags() {
     assert_eq!(matches.get_one::<u64>("chunk-delay").copied(), Some(3));
     assert_eq!(matches.get_one::<usize>("chunk-size").copied(), Some(50));
     assert_eq!(matches.get_one::<u8>("clear-task-type").copied(), Some(2));
+}
+
+#[test]
+fn t_retry_failed_flag() {
+    let cmd = build_app();
+    let matches = cmd
+        .clone()
+        .try_get_matches_from(["rss2pan", "--retry-failed"])
+        .unwrap();
+    assert_eq!(matches.get_one::<bool>("retry-failed").copied(), Some(true));
+
+    assert!(cmd
+        .try_get_matches_from(["rss2pan", "--retry-failed", "--clear-task-type", "2"])
+        .is_err());
 }

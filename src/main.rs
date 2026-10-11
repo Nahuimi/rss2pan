@@ -13,10 +13,10 @@ mod utils;
 use std::path::PathBuf;
 
 use app::build_app;
-use db::{BlacklistService, RssService};
+use db::Database;
 use pan115::Pan115Client;
 use request::{ensure_default_config_file, load_default_app_config, Ajax, AppConfig};
-use runner::{RunOptions, TaskRunner};
+use runner::{RetryOutcome, RunOptions, TaskRunner};
 use utils::get_magnet_list_by_txt;
 
 #[tokio::main]
@@ -42,6 +42,23 @@ async fn main() -> anyhow::Result<()> {
     if let Some(clear_task_type) = matches.get_one::<u8>("clear-task-type").copied() {
         pan115.ensure_logged_in().await?;
         pan115.clear_offline_tasks(clear_task_type - 1).await?;
+        return Ok(());
+    }
+
+    if matches.get_one::<bool>("retry-failed").copied() == Some(true) {
+        let database = open_database_for(&ajax)?;
+        match runner.retry_failed_tasks(&database.rss).await {
+            Ok(outcome) => {
+                print_retry_outcome(&outcome);
+                if !outcome.is_success() {
+                    std::process::exit(1);
+                }
+            }
+            Err(err) => {
+                print_error(&err);
+                std::process::exit(1);
+            }
+        }
         return Ok(());
     }
 
@@ -75,11 +92,9 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut service = RssService::open_path(ajax.database_path())?;
-    let blacklist = BlacklistService::open_path(
-        ajax.blacklist_database_path(),
-        ajax.app_config().blacklist.retention_months,
-    )?;
+    let database = open_database_for(&ajax)?;
+    let mut service = database.rss;
+    let blacklist = database.blacklist;
     if let Some(url) = matches.get_one::<String>("url") {
         if let Err(err) = runner.execute_url(&mut service, &blacklist, url).await {
             print_error(&err);
@@ -108,6 +123,28 @@ fn print_error(err: &anyhow::Error) {
     for cause in err.chain().skip(1) {
         eprintln!("caused by: {cause}");
     }
+}
+
+/// 打开 `db.sqlite`。旧的 `blacklist.sqlite` 会在这里被导入并改名为 `.bak`。
+fn open_database_for(ajax: &Ajax) -> anyhow::Result<Database> {
+    let config = ajax.app_config();
+    db::open_database(
+        ajax.database_path(),
+        ajax.legacy_blacklist_path().as_deref(),
+        config.blacklist.retention_months,
+    )
+}
+
+fn print_retry_outcome(outcome: &RetryOutcome) {
+    println!(
+        "failed tasks: {}, deleted: {}, resubmitted: {} (from db.sqlite: {}, from 115 api: {}), resubmit failures: {}",
+        outcome.failed_tasks,
+        outcome.deleted_tasks,
+        outcome.resubmitted,
+        outcome.from_database,
+        outcome.from_api,
+        outcome.resubmit_failures
+    );
 }
 
 fn init_logger(default_level: &str) {

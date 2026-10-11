@@ -15,7 +15,7 @@ RSS 站点抓取已从 `reqwest` 切换到 `wreq`，并针对 Cloudflare Worker 
 
 - [x] 115 离线功能
 - [x] sqlite 存储数据
-- [x] 黑名单 sqlite 存储与自动过期
+- [x] 黑名单存储与自动过期（和 RSS 数据共用 `db.sqlite`）
 - [x] 实现 cli
 - [x] `/add` HTTP API
 - [x] `savepath` 支持
@@ -24,6 +24,7 @@ RSS 站点抓取已从 `reqwest` 切换到 `wreq`，并针对 Cloudflare Worker 
 - [x] `--qrcode-app`
 - [x] `--no-cache`
 - [x] `--clear-task-type`
+- [x] `--retry-failed` 重试失败的离线任务
 - [x] `--chunk-delay`
 - [x] `--chunk-size`
 - [x] `config.toml` 代理 / 站点 / cookie 配置
@@ -77,6 +78,8 @@ rss2pan --rss custom-rss.json
 rss2pan -u "https://mikanani.me/RSS/Bangumi?bangumiId=2739&subgroupid=12"
 # --clear-task-type 清除离线任务。1: 已完成的 2: 所有任务 3: 失败任务 4: 运行的任务 5: 完成并删除的任务 6: 所有的任务
 rss2pan --clear-task-type 1
+# 重试失败的离线任务：先删除失败任务，再用 db.sqlite 里的 cid/savepath 重新提交
+rss2pan --retry-failed
 
 # 查看 magnet 子命令帮助
 rss2pan magnet -h
@@ -155,6 +158,8 @@ curl -H "Content-Type: application/json" -d "{\"tasks\":[\"magnet:?xt=urn:btih:x
 
 `savepath` 是可选项，直接作为 `add_task_urls` 请求体里的 `savepath` 字段提交给 115；不设置时保持 115 默认行为。
 
+提交成功后，程序会把这条连接的 `magnet` 以及本次使用的 `cid`、`savepath` 一起写进 `db.sqlite` 的 `rss_items` 表。`--retry-failed` 重试失败任务时会优先使用这里保存的参数。
+
 获取方法: 浏览器打开 115 的文件，地址栏像 `https://115.com/?cid=2479224057885794455&offset=0&tab=&mode=wangpan`
 
 > 其中 `2479224057885794455` 就是 `cid`
@@ -172,7 +177,6 @@ address = "http://127.0.0.1:10808"
 
 [paths]
 database = "db.sqlite"
-blacklist = "blacklist.sqlite"
 rss = "rss.json"
 
 [log]
@@ -208,8 +212,7 @@ domains = ["rsshub.app"]
 
 #### 路径配置
 
-- `[paths].database`：sqlite 数据库文件路径，默认是 `db.sqlite`。
-- `[paths].blacklist`：RSS 黑名单数据库路径，默认是 `blacklist.sqlite`。
+- `[paths].database`：sqlite 数据库文件路径，默认是 `db.sqlite`。RSS 记录、站点状态和黑名单都在这个文件里。
 - `[paths].rss`：默认 RSS 配置文件路径，默认是 `rss.json`。
 - CLI `--rss` 的优先级高于 `[paths].rss`。
 - 如果你想把数据库或 RSS 配置放到其他目录，可以直接改成相对路径或绝对路径。
@@ -217,12 +220,19 @@ domains = ["rsshub.app"]
 - Windows 推荐写成：`'D:\ruanjian\rss2pan\db.sqlite'`，或者 `"D:/ruanjian/rss2pan/db.sqlite"`。
 - 为了兼容常见写法，`[paths]` 里也接受 `"D:\ruanjian\rss2pan\db.sqlite"` 这种未转义反斜杠路径。
 
+#### 从 `blacklist.sqlite` 迁移
+
+- 旧版本用单独的 `blacklist.sqlite` 保存黑名单。现在黑名单表 `rss_blacklist` 和 RSS 数据一起放在 `[paths].database` 里。
+- 第一次打开数据库时，如果发现旧的 `blacklist.sqlite`（`[paths].blacklist` 指定的路径，或者当前目录下的 `blacklist.sqlite`），程序会把里面的黑名单记录导入 `db.sqlite`，然后把旧文件改名为 `blacklist.sqlite.bak`。
+- 导入完成后 `[paths].blacklist` 这个键就不再需要，程序回写 `config.toml` 时也不会再写入它。
+- 如果旧文件不是有效的 sqlite 数据库，程序只会打印一条警告并跳过，不会删除它。
+
 #### RSS 黑名单
 
 - `[blacklist].exclude`：和 `rss.json` 里的 `filter` 规则一致。普通字符串按标题包含匹配；`/regex/` 按正则匹配。
 - `[blacklist].retention_months`：黑名单保留月数，默认 `6`。程序启动时会自动删除更早的黑名单记录。
-- 当某个 RSS 源里出现匹配 `exclude` 的标题，并且当前 RSS 处理成功后，程序会把这条记录的 `link`、`title`、`createdAt`、`updatedAt` 以及 RSS 链接写入黑名单库。
-- 黑名单库按 RSS 链接去重；同一条 RSS 下一次运行会直接跳过，不再抓取和提交。
+- 当某个 RSS 源里出现匹配 `exclude` 的标题，并且当前 RSS 处理成功后，程序会把这条记录的 `link`、`title`、`createdAt`、`updatedAt` 以及 RSS 链接写入 `db.sqlite` 的 `rss_blacklist` 表。
+- 黑名单按 RSS 链接去重；同一条 RSS 下一次运行会直接跳过，不再抓取和提交。
 
 例如：
 
@@ -233,6 +243,28 @@ retention_months = 6
 ```
 
 上面的配置适合把出现 `合集`、`fin`、`end` 的 RSS 源视为完结源，后续自动跳过。
+
+#### 重试失败的离线任务
+
+`--retry-failed` 用来重试 115 上状态是失败（`status = -1`）的离线任务：
+
+1. 分页拉取 115 离线任务列表，筛出失败任务，按 `info_hash` 去重。
+2. 先调用 `task_del` 把这些失败任务删掉（不删除已下载的文件），避免重新提交时提示“任务已存在”。
+3. 再重新提交这些连接：
+   - 连接在 `db.sqlite` 的 `rss_items` 里有记录时，使用记录里的 `cid` 和 `savepath`（记录里没有 `savepath` 就不传；记录里没有 `cid` 时退回用 115 返回的 `wp_path_id`）。
+   - 数据库里没有记录时，使用 115 任务列表返回的 `wp_path_id` 作为 `cid`，不带 `savepath`。
+4. 同一组 `cid` / `savepath` 的连接会合并成一次 `add_task_urls` 请求，分块大小和间隔仍然由 `--chunk-size`、`--chunk-delay` 控制。
+
+```bash
+# 重试失败的离线任务
+rss2pan --retry-failed
+# 控制分块和间隔
+rss2pan --retry-failed --chunk-size 50 --chunk-delay 3
+```
+
+- `--retry-failed` 和 `--clear-task-type` 不能同时使用。
+- 结束后会打印失败任务数、删除数、重新提交数（分别来自 `db.sqlite` 和 115 API）以及提交失败数；有提交失败时退出码是 `1`。
+- 数据库里没有记录的重试**不会**写回 `db.sqlite`。
 
 #### 代理配置
 

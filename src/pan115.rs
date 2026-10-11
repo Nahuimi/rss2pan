@@ -19,6 +19,8 @@ use crate::{
 
 const API_ADD_OFFLINE_URL: &str = "https://lixian.115.com/lixianssp/?ac=add_task_urls";
 const API_CLEAR_OFFLINE_URL: &str = "https://lixian.115.com/lixian/?ct=lixian&ac=task_clear";
+const API_LIST_OFFLINE_URL: &str = "https://lixian.115.com/lixian/?ct=lixian&ac=task_lists";
+const API_DELETE_OFFLINE_URL: &str = "https://lixian.115.com/lixian/?ct=lixian&ac=task_del";
 const API_STATUS_CHECK: &str = "https://my.115.com/?ct=guide&ac=status";
 const API_USER_INFO: &str = "https://my.115.com/?ct=ajax&ac=nav";
 const API_QRCODE_TOKEN_URL: &str = "https://qrcodeapi.115.com/api/1.0/%s/1.0/token";
@@ -31,6 +33,43 @@ const UA_115_BROWSER: &str = "Mozilla/5.0 115Browser/27.0.5.7";
 const REQUIRED_COOKIE_NAMES: [&str; 3] = ["UID", "CID", "SEID"];
 const QRCODE_LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
 const QRCODE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// 115 离线任务列表中下载失败的状态值。
+const OFFLINE_TASK_STATUS_FAILED: i64 = -1;
+const MAX_OFFLINE_TASK_PAGES: i64 = 200;
+
+/// 115 离线任务列表里的一条任务。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct OfflineTask {
+    #[serde(rename = "info_hash", default)]
+    pub info_hash: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default, deserialize_with = "deserialize_i64_or_string")]
+    pub status: i64,
+    #[serde(
+        rename = "wp_path_id",
+        default,
+        deserialize_with = "deserialize_optional_id"
+    )]
+    pub wp_path_id: Option<String>,
+}
+
+impl OfflineTask {
+    /// 115 里下载失败的任务状态是 `-1`。
+    pub fn is_failed(&self) -> bool {
+        self.status == OFFLINE_TASK_STATUS_FAILED
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct OfflineTaskListPage {
+    #[serde(default)]
+    tasks: Vec<OfflineTask>,
+    #[serde(default, deserialize_with = "deserialize_i64_or_string")]
+    page_count: i64,
+}
 
 #[derive(Debug, Deserialize)]
 struct QrcodeEnvelope<T> {
@@ -398,6 +437,59 @@ impl Pan115Client {
         Ok(())
     }
 
+    /// 分页拉取全部离线任务。
+    pub async fn list_offline_tasks(&self) -> Result<Vec<OfflineTask>> {
+        let mut tasks = Vec::new();
+        let mut page = 1i64;
+        loop {
+            let value = self
+                .request_json(
+                    self.req(Method::POST, API_LIST_OFFLINE_URL)?
+                        .query(&[("page", page.to_string())]),
+                    API_LIST_OFFLINE_URL,
+                )
+                .await?;
+            ensure_success(&value)?;
+            let payload: OfflineTaskListPage =
+                serde_json::from_value(value).context("decode 115 offline task list failed")?;
+            tasks.extend(payload.tasks);
+
+            let page_count = payload.page_count.max(1);
+            if page >= page_count || page >= MAX_OFFLINE_TASK_PAGES {
+                break;
+            }
+            page += 1;
+        }
+        Ok(tasks)
+    }
+
+    /// 按 `info_hash` 删除离线任务。`delete_files` 为 `true` 时会同时删除已下载的文件。
+    pub async fn delete_offline_tasks(&self, hashes: &[String], delete_files: bool) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+
+        let mut form = url::form_urlencoded::Serializer::new(String::new());
+        for hash in hashes {
+            form.append_pair("hash", hash);
+        }
+        form.append_pair("flag", if delete_files { "1" } else { "0" });
+
+        let value = self
+            .request_json(
+                self.req(Method::POST, API_DELETE_OFFLINE_URL)?
+                    .header(
+                        wreq::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
+                    .body(form.finish()),
+                API_DELETE_OFFLINE_URL,
+            )
+            .await?;
+        ensure_success(&value)?;
+        Ok(())
+    }
+
     pub async fn add_offline_urls(
         &self,
         uris: &[String],
@@ -544,6 +636,31 @@ fn json_bool(value: &Value) -> Option<bool> {
         },
         _ => None,
     }
+}
+
+/// 115 返回的数字字段有时是字符串，这里两种都接受。
+fn deserialize_i64_or_string<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.as_ref().and_then(json_i64).unwrap_or_default())
+}
+
+/// `wp_path_id` 可能是数字也可能是字符串，统一转成非空字符串。
+fn deserialize_optional_id<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value
+        .and_then(|value| match value {
+            Value::String(text) => Some(text),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        })
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty()))
 }
 
 fn parse_json_response_bytes(body: &[u8]) -> Result<Value> {
@@ -839,5 +956,42 @@ mod tests {
             assert!(path.exists());
         }
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_offline_task_parses_failed_status_and_numeric_dir_id() {
+        let task: OfflineTask = serde_json::from_value(serde_json::json!({
+            "info_hash": "abc",
+            "name": "test",
+            "url": "magnet:?xt=urn:btih:abc",
+            "status": -1,
+            "wp_path_id": 2479224057885794455i64
+        }))
+        .unwrap();
+
+        assert!(task.is_failed());
+        assert_eq!(task.url, "magnet:?xt=urn:btih:abc");
+        assert_eq!(task.wp_path_id.as_deref(), Some("2479224057885794455"));
+    }
+
+    #[test]
+    fn test_offline_task_list_page_accepts_string_fields() {
+        let page: OfflineTaskListPage = serde_json::from_value(serde_json::json!({
+            "page_count": "2",
+            "tasks": [{ "info_hash": "abc", "status": "1", "wp_path_id": "" }]
+        }))
+        .unwrap();
+
+        assert_eq!(page.page_count, 2);
+        assert_eq!(page.tasks.len(), 1);
+        assert!(!page.tasks[0].is_failed());
+        assert_eq!(page.tasks[0].wp_path_id, None);
+    }
+
+    #[test]
+    fn test_offline_task_list_page_defaults_when_missing() {
+        let page: OfflineTaskListPage = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(page.page_count, 0);
+        assert!(page.tasks.is_empty());
     }
 }

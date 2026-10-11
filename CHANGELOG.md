@@ -1,3 +1,11 @@
+# Unreleased
+
+## 变化
+
+- 黑名单合并进 `db.sqlite`，不再单独使用 `blacklist.sqlite`；首次打开数据库时会自动导入旧文件并改名为 `blacklist.sqlite.bak`
+- `rss_items` 表新增 `cid`、`savepath` 两列，记录每条连接离线时使用的参数
+- 新增 `--retry-failed`：删除 115 上失败的离线任务后用 `db.sqlite` 里的 `cid`/`savepath` 重新提交，数据库里没有记录时使用 115 返回的 `wp_path_id`
+
 # v0.2.3
 
 ## 变化

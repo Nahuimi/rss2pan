@@ -644,8 +644,15 @@ mod tests {
             .iter()
             .filter_map(|item| site.get_magnet_item(item))
             .collect();
-        let res = service.save_items(&items, true);
+        let res = service.save_items(&items, true, Some("12345"), Some("番剧/测试"));
         assert!(res.is_ok());
+
+        let stored = service
+            .find_items_by_magnets(&[items[0].magnet.clone()])
+            .unwrap();
+        let first = stored.get(&items[0].magnet).unwrap();
+        assert_eq!(first.cid.as_deref(), Some("12345"));
+        assert_eq!(first.savepath.as_deref(), Some("番剧/测试"));
     }
 
     #[test]

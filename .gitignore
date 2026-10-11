@@ -1,5 +1,6 @@
 /target
 /.idea
+/.acl-report
 db.sqlite
 .cookies
 AGENTS.md

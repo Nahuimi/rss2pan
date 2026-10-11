@@ -16,7 +16,6 @@ use wreq::{
 const CONFIG_FILE_NAME: &str = "config.toml";
 const DEFAULT_PROXY_ADDRESS: &str = "http://127.0.0.1:10808";
 const DEFAULT_DATABASE_PATH: &str = "db.sqlite";
-const DEFAULT_BLACKLIST_DATABASE_PATH: &str = "blacklist.sqlite";
 const DEFAULT_RSS_PATH: &str = "rss.json";
 const DEFAULT_LOG_LEVEL: &str = "info";
 const USER_AGENT: &str =
@@ -74,7 +73,10 @@ impl Default for ProxyConfig {
 #[serde(default)]
 pub struct PathsConfig {
     pub database: String,
-    pub blacklist: String,
+    /// 旧版黑名单数据库路径。黑名单已经合并进 `database`，这里只在首次导入旧数据时使用，
+    /// 序列化时不会再写回 `config.toml`。
+    #[serde(default, skip_serializing)]
+    pub blacklist: Option<String>,
     #[serde(
         default = "default_rss_paths",
         deserialize_with = "deserialize_rss_paths",
@@ -87,7 +89,7 @@ impl Default for PathsConfig {
     fn default() -> Self {
         Self {
             database: DEFAULT_DATABASE_PATH.to_string(),
-            blacklist: DEFAULT_BLACKLIST_DATABASE_PATH.to_string(),
+            blacklist: None,
             rss: default_rss_paths(),
         }
     }
@@ -568,7 +570,7 @@ fn load_app_config(path: &Path) -> Result<AppConfig> {
         config.paths.database = database;
     }
     if let Some(blacklist) = path_overrides.blacklist {
-        config.paths.blacklist = blacklist;
+        config.paths.blacklist = Some(blacklist);
     }
     if let Some(rss) = path_overrides.rss {
         config.paths.rss = rss;
@@ -737,8 +739,13 @@ impl Ajax {
         PathBuf::from(self.app_config().paths.database)
     }
 
-    pub fn blacklist_database_path(&self) -> PathBuf {
-        PathBuf::from(self.app_config().paths.blacklist)
+    /// 旧版 `blacklist.sqlite` 路径，只用于把它导入 `db.sqlite`。
+    pub fn legacy_blacklist_path(&self) -> Option<PathBuf> {
+        self.app_config()
+            .paths
+            .blacklist
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from)
     }
 
     pub fn resolve_site(&self, host: &str) -> ResolvedSiteConfig {
@@ -909,7 +916,7 @@ mod tests {
         let content = default_config_toml().unwrap();
         assert!(content.contains("[paths]"));
         assert!(content.contains("database = \"db.sqlite\""));
-        assert!(content.contains("blacklist = \"blacklist.sqlite\""));
+        assert!(!content.contains("blacklist = "));
         assert!(content.contains("rss = \"rss.json\""));
         assert!(content.contains("[log]"));
         assert!(content.contains("level = \"info\""));
@@ -939,8 +946,8 @@ mod tests {
             "D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\db.sqlite"
         );
         assert_eq!(
-            config.paths.blacklist,
-            "D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\blacklist.sqlite"
+            config.paths.blacklist.as_deref(),
+            Some("D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\blacklist.sqlite")
         );
         assert_eq!(
             config.paths.rss,
@@ -979,8 +986,8 @@ mod tests {
             "D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\db.sqlite"
         );
         assert_eq!(
-            ajax.app_config().paths.blacklist,
-            "D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\blacklist.sqlite"
+            ajax.app_config().paths.blacklist.as_deref(),
+            Some("D:\\ruanjian\\WingetUI-data\\winget\\rss2pan\\123\\blacklist.sqlite")
         );
 
         remove_temp_file(&path);
@@ -1286,7 +1293,39 @@ proxy = ["mikanime.tv"]
         assert!(
             saved.contains("domains = [\"share.acgnx.se\", \"www.acgnx.se\", \"share.acgnx.net\"]")
         );
+        assert!(!saved.contains("blacklist = "));
 
         remove_temp_file(&path);
+    }
+
+    #[test]
+    fn test_legacy_blacklist_path_comes_from_config_once() {
+        let default_path = write_temp_config("legacy-absent", &default_config_toml().unwrap());
+        let ajax = Ajax::with_config_path(None, default_path.clone()).unwrap();
+        assert_eq!(ajax.legacy_blacklist_path(), None);
+        remove_temp_file(&default_path);
+
+        let legacy_path = write_temp_config(
+            "legacy-present",
+            "[paths]\nblacklist = 'legacy-blacklist.sqlite'\n\n[template.mikanani]\ndomains = [\"mikanani.me\"]\n",
+        );
+        let ajax = Ajax::with_config_path(None, legacy_path.clone()).unwrap();
+        assert_eq!(
+            ajax.legacy_blacklist_path(),
+            Some(PathBuf::from("legacy-blacklist.sqlite"))
+        );
+
+        ajax.save_cookie_config("115.com", "UID=1;CID=2;SEID=3")
+            .unwrap();
+        let saved = fs::read_to_string(&legacy_path).unwrap();
+        assert!(!saved.contains("blacklist = "));
+        assert_eq!(
+            Ajax::with_config_path(None, legacy_path.clone())
+                .unwrap()
+                .legacy_blacklist_path(),
+            None
+        );
+
+        remove_temp_file(&legacy_path);
     }
 }

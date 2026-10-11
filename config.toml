@@ -3,7 +3,6 @@ address = "http://127.0.0.1:10808"
 
 [paths]
 database = "db.sqlite"
-blacklist = "blacklist.sqlite"
 rss = "rss.json"
 
 [log]
