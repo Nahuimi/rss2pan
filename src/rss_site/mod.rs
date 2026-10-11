@@ -18,7 +18,11 @@ pub use mikanani::*;
 pub use nyaa::*;
 pub use rsshub::*;
 
-use crate::{request::Ajax, rss_config::RssConfig, utils::canonicalize_magnet};
+use crate::{
+    request::{is_retryable_wreq_error, Ajax},
+    rss_config::RssConfig,
+    utils::canonicalize_magnet,
+};
 
 const RSS_FETCH_TIMEOUT: Duration = Duration::from_secs(45);
 const RSS_FETCH_RETRY_DELAYS: [Duration; 4] = [
@@ -319,13 +323,6 @@ fn is_retryable_status(status: wreq::StatusCode) -> bool {
     status == wreq::StatusCode::REQUEST_TIMEOUT
         || status == wreq::StatusCode::TOO_MANY_REQUESTS
         || status.is_server_error()
-}
-
-fn is_retryable_wreq_error(err: &wreq::Error) -> bool {
-    err.is_timeout()
-        || err.is_connect()
-        || err.is_body()
-        || matches!(err.status(), Some(status) if status.is_server_error())
 }
 
 fn is_cloudflare_1101(detail: Option<&str>) -> bool {

@@ -13,7 +13,7 @@ use wreq::{Method, RequestBuilder};
 
 use crate::{
     m115::crypto,
-    request::Ajax,
+    request::{is_retryable_request_error, Ajax},
     utils::{open_qrcode_image, remove_qrcode_image, write_qrcode_image},
 };
 
@@ -36,6 +36,12 @@ const QRCODE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// 115 离线任务列表中下载失败的状态值。
 const OFFLINE_TASK_STATUS_FAILED: i64 = -1;
 const MAX_OFFLINE_TASK_PAGES: i64 = 200;
+/// 115 API 遇到连接被断开、超时、5xx 这类瞬时错误时的重试间隔。
+const API_REQUEST_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
 
 /// 115 离线任务列表里的一条任务。
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -234,7 +240,46 @@ impl Pan115Client {
             .header(wreq::header::USER_AGENT, UA_115_BROWSER))
     }
 
+    /// 发送请求并解析 JSON。连接被断开、超时、5xx 这类瞬时错误会重试
+    /// [`API_REQUEST_RETRY_DELAYS`] 次，其他错误（参数错误、115 业务错误、
+    /// JSON 解析失败）直接返回。
     async fn request_json(&self, request: RequestBuilder, endpoint: &str) -> Result<Value> {
+        let max_attempts = API_REQUEST_RETRY_DELAYS.len() + 1;
+        let mut current = request;
+        for attempt in 1..=max_attempts {
+            let retry_request = if attempt < max_attempts {
+                current.try_clone()
+            } else {
+                None
+            };
+            match self.request_json_once(current, endpoint).await {
+                Ok(value) => return Ok(value),
+                Err(err) => {
+                    if attempt >= max_attempts || !is_retryable_request_error(&err) {
+                        return Err(err);
+                    }
+                    let Some(retry_request) = retry_request else {
+                        return Err(err);
+                    };
+                    let delay = API_REQUEST_RETRY_DELAYS[attempt - 1];
+                    log::warn!(
+                        "retrying 115 api request attempt {}/{} for {} in {:?} after {}",
+                        attempt + 1,
+                        max_attempts,
+                        endpoint,
+                        delay,
+                        err
+                    );
+                    sleep(delay).await;
+                    current = retry_request;
+                }
+            }
+        }
+
+        unreachable!()
+    }
+
+    async fn request_json_once(&self, request: RequestBuilder, endpoint: &str) -> Result<Value> {
         let response = request
             .send()
             .await

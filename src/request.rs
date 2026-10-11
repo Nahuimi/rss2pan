@@ -640,6 +640,65 @@ pub fn build_rss_client() -> Client {
     build_client_with_proxy(None).unwrap()
 }
 
+/// 判断错误链里是否包含「连接被对端断开」这一类瞬时网络错误。
+///
+/// HTTP/2 连接在请求过程中被对端关闭时，`http2` crate 会上报
+/// `io::ErrorKind::BrokenPipe`，错误文本是 `stream closed because of a broken pipe`
+/// 或 `connection closed because of a broken pipe`；HTTP/1.1 下常见的是
+/// `connection closed before message completed`。这些错误只说明这一条连接断了
+/// （代理、Cloudflare 或对端空闲回收都可能触发），换一条连接重试通常就能成功。
+pub fn is_transient_connection_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    const MARKERS: [&str; 8] = [
+        "broken pipe",
+        "connection reset",
+        "connection aborted",
+        "connection closed",
+        "stream closed",
+        "unexpected eof",
+        "incomplete message",
+        "end of file before message length reached",
+    ];
+
+    let mut current = Some(err);
+    while let Some(err) = current {
+        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io_err.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::NotConnected
+            ) {
+                return true;
+            }
+        }
+        let message = err.to_string().to_ascii_lowercase();
+        if MARKERS.iter().any(|marker| message.contains(marker)) {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
+/// `wreq` 请求失败后是否值得重试。
+pub fn is_retryable_wreq_error(err: &wreq::Error) -> bool {
+    err.is_timeout()
+        || err.is_connect()
+        || err.is_connection_reset()
+        || err.is_body()
+        || is_transient_connection_error(err)
+        || matches!(err.status(), Some(status) if status.is_server_error())
+}
+
+/// 从 `anyhow` 错误链里找出底层的 `wreq` 错误，判断这次请求是否值得重试。
+pub fn is_retryable_request_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<wreq::Error>())
+        .is_some_and(is_retryable_wreq_error)
+}
+
 fn find_template_config<'a>(
     templates: &'a BTreeMap<String, TemplateConfig>,
     host: &str,
@@ -888,7 +947,10 @@ impl Ajax {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_config_toml, Ajax, AppConfig, ResolvedSiteConfig};
+    use super::{
+        default_config_toml, is_retryable_request_error, is_transient_connection_error, Ajax,
+        AppConfig, ResolvedSiteConfig,
+    };
     use std::{env, fs, path::PathBuf};
     use wreq::Method;
 
@@ -1327,5 +1389,84 @@ proxy = ["mikanime.tv"]
         );
 
         remove_temp_file(&legacy_path);
+    }
+
+    #[test]
+    fn test_transient_connection_error_detects_broken_pipe_io_error() {
+        let err = std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "stream closed because of a broken pipe",
+        );
+        assert!(is_transient_connection_error(&err));
+
+        let err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
+        assert!(is_transient_connection_error(&err));
+    }
+
+    #[test]
+    fn test_transient_connection_error_walks_source_chain() {
+        #[derive(Debug)]
+        struct Wrapper(std::io::Error);
+
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error sending request for url (https://example.com/rss)")
+            }
+        }
+
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let err = Wrapper(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "connection closed because of a broken pipe",
+        ));
+        assert!(is_transient_connection_error(&err));
+    }
+
+    #[test]
+    fn test_transient_connection_error_matches_foreign_error_message() {
+        #[derive(Debug)]
+        struct MessageOnly(&'static str);
+
+        impl std::fmt::Display for MessageOnly {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+
+        impl std::error::Error for MessageOnly {}
+
+        assert!(is_transient_connection_error(&MessageOnly(
+            "connection closed before message completed"
+        )));
+        assert!(is_transient_connection_error(&MessageOnly(
+            "end of file before message length reached"
+        )));
+        assert!(!is_transient_connection_error(&MessageOnly(
+            "invalid xml at line 3"
+        )));
+    }
+
+    #[test]
+    fn test_transient_connection_error_ignores_unrelated_errors() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file or directory");
+        assert!(!is_transient_connection_error(&err));
+
+        let err = std::io::Error::new(std::io::ErrorKind::TimedOut, "operation timed out");
+        assert!(!is_transient_connection_error(&err));
+    }
+
+    #[test]
+    fn test_retryable_request_error_ignores_non_http_errors() {
+        let err = anyhow::anyhow!("decode 115 api response failed: expected value");
+        assert!(!is_retryable_request_error(&err));
+
+        let err =
+            anyhow::anyhow!("invalid xml").context("request 115 api failed: https://115.com/");
+        assert!(!is_retryable_request_error(&err));
     }
 }

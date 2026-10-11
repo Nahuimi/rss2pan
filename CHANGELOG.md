@@ -6,6 +6,10 @@
 - `rss_items` 表新增 `cid`、`savepath` 两列，记录每条连接离线时使用的参数
 - 新增 `--retry-failed`：删除 115 上失败的离线任务后用 `db.sqlite` 里的 `cid`/`savepath` 重新提交，数据库里没有记录时使用 115 返回的 `wp_path_id`
 
+## 修复
+
+- 连接被对端断开（HTTP/2 的 `stream closed because of a broken pipe`、HTTP/1.1 的 `connection closed before message completed` 等）现在按瞬时错误处理：RSS 抓取会重试，重试仍失败时只跳过该 RSS 源；115 API 请求也会重试，不再因为一次断连中断整个任务
+
 # v0.2.3
 
 ## 变化
