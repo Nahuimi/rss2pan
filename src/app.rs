@@ -47,7 +47,7 @@ pub fn build_app() -> Command {
                 .value_parser(value_parser!(u8).range(1..=6)),
         )
         .arg(
-            arg!(--"retry-failed" "delete failed 115 offline tasks and add them back again")
+            arg!(--"retry-failed" "retry failed 115 offline tasks (115 restart api, fallback to delete and re-add)")
                 .action(ArgAction::SetTrue)
                 .conflicts_with("clear-task-type"),
         )

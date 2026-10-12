@@ -60,7 +60,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -151,7 +151,7 @@ jobs:
           Compress-Archive -Path $stageDir -DestinationPath "dist/${{ matrix.archive_name }}" -Force
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: rss2pan-${{ matrix.target }}
           path: dist/${{ matrix.archive_name }}

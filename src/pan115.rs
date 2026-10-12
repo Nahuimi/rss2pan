@@ -21,6 +21,8 @@ const API_ADD_OFFLINE_URL: &str = "https://lixian.115.com/lixianssp/?ac=add_task
 const API_CLEAR_OFFLINE_URL: &str = "https://lixian.115.com/lixian/?ct=lixian&ac=task_clear";
 const API_LIST_OFFLINE_URL: &str = "https://lixian.115.com/lixian/?ct=lixian&ac=task_lists";
 const API_DELETE_OFFLINE_URL: &str = "https://lixian.115.com/lixian/?ct=lixian&ac=task_del";
+/// 115 官方的重试接口，可以直接让失败的离线任务重新开始下载。
+const API_RESTART_OFFLINE_URL: &str = "https://clouddownload.115.com/?ac=restart";
 const API_STATUS_CHECK: &str = "https://my.115.com/?ct=guide&ac=status";
 const API_USER_INFO: &str = "https://my.115.com/?ct=ajax&ac=nav";
 const API_QRCODE_TOKEN_URL: &str = "https://qrcodeapi.115.com/api/1.0/%s/1.0/token";
@@ -42,6 +44,8 @@ const API_REQUEST_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(2),
     Duration::from_secs(4),
 ];
+/// 逐个删除离线任务时的间隔，避免请求过于密集。
+const DELETE_REQUEST_INTERVAL: Duration = Duration::from_millis(300);
 
 /// 115 离线任务列表里的一条任务。
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -179,6 +183,8 @@ impl Pan115Error {
                 10004 => Pan115ErrorKind::InvalidLink,
                 10008 => Pan115ErrorKind::TaskExisted,
                 20004 => Pan115ErrorKind::Exist,
+                // 115 有时用 `errno = 0` + `state = false` 返回“任务已存在”，只能按文案判断。
+                _ if message_means_task_existed(message.as_deref()) => Pan115ErrorKind::TaskExisted,
                 _ => Pan115ErrorKind::Unexpected,
             },
             code,
@@ -508,30 +514,42 @@ impl Pan115Client {
         Ok(tasks)
     }
 
-    /// 按 `info_hash` 删除离线任务。`delete_files` 为 `true` 时会同时删除已下载的文件。
-    pub async fn delete_offline_tasks(&self, hashes: &[String], delete_files: bool) -> Result<()> {
-        if hashes.is_empty() {
-            return Ok(());
-        }
-
-        let mut form = url::form_urlencoded::Serializer::new(String::new());
-        for hash in hashes {
-            form.append_pair("hash", hash);
-        }
-        form.append_pair("flag", if delete_files { "1" } else { "0" });
-
+    /// 让 115 重新下载一个失败的离线任务（115 官方的“重试”接口，不需要先删除任务）。
+    pub async fn restart_offline_task(&self, info_hash: &str) -> Result<()> {
         let value = self
             .request_json(
-                self.req(Method::POST, API_DELETE_OFFLINE_URL)?
-                    .header(
-                        wreq::header::CONTENT_TYPE,
-                        "application/x-www-form-urlencoded",
-                    )
-                    .body(form.finish()),
-                API_DELETE_OFFLINE_URL,
+                self.req(Method::POST, API_RESTART_OFFLINE_URL)?
+                    .form(&[("info_hash", info_hash)]),
+                API_RESTART_OFFLINE_URL,
             )
             .await?;
         ensure_success(&value)?;
+        Ok(())
+    }
+
+    /// 按 `info_hash` 删除离线任务。`delete_files` 为 `true` 时会同时删除已下载的文件。
+    ///
+    /// `task_del` 一次只可靠地删除一个任务（多个 `hash` 参数只会生效一个），所以这里逐个提交。
+    pub async fn delete_offline_tasks(&self, hashes: &[String], delete_files: bool) -> Result<()> {
+        for hash in hashes {
+            let mut form = url::form_urlencoded::Serializer::new(String::new());
+            form.append_pair("hash", hash);
+            form.append_pair("flag", if delete_files { "1" } else { "0" });
+
+            let value = self
+                .request_json(
+                    self.req(Method::POST, API_DELETE_OFFLINE_URL)?
+                        .header(
+                            wreq::header::CONTENT_TYPE,
+                            "application/x-www-form-urlencoded",
+                        )
+                        .body(form.finish()),
+                    API_DELETE_OFFLINE_URL,
+                )
+                .await?;
+            ensure_success(&value)?;
+            sleep(DELETE_REQUEST_INTERVAL).await;
+        }
         Ok(())
     }
 
@@ -651,6 +669,16 @@ fn extract_message(value: &Value) -> Option<String> {
         .into_iter()
         .find_map(|key| value.get(key).and_then(|value| value.as_str()))
         .map(|value| value.to_string())
+}
+
+/// 115 有些接口用 `errno = 0` + `state = false` 表示“任务已存在”，只能按文案判断。
+fn message_means_task_existed(message: Option<&str>) -> bool {
+    message.is_some_and(|message| {
+        let message = message.trim();
+        message.contains("已存在")
+            || message.contains("重复的链接")
+            || message.to_ascii_lowercase().contains("already exist")
+    })
 }
 
 fn first_non_zero<const N: usize>(values: [Option<&Value>; N]) -> Option<i64> {
@@ -882,6 +910,30 @@ mod tests {
             Pan115ErrorKind::TaskExisted
         );
         assert_eq!(Pan115Error::new(99, None).kind(), Pan115ErrorKind::NotLogin);
+    }
+
+    #[test]
+    fn test_pan115_error_message_maps_to_task_existed() {
+        assert_eq!(
+            Pan115Error::new(0, Some("任务已存在，请勿输入重复的链接地址".to_string())).kind(),
+            Pan115ErrorKind::TaskExisted
+        );
+        assert_eq!(
+            Pan115Error::new(0, Some("Task already exists".to_string())).kind(),
+            Pan115ErrorKind::TaskExisted
+        );
+        assert_eq!(
+            Pan115Error::new(20004, Some("目标已存在".to_string())).kind(),
+            Pan115ErrorKind::Exist
+        );
+        assert_eq!(
+            Pan115Error::new(0, Some("系统繁忙，请稍后再试".to_string())).kind(),
+            Pan115ErrorKind::Unexpected
+        );
+        assert_eq!(
+            Pan115Error::new(0, None).kind(),
+            Pan115ErrorKind::Unexpected
+        );
     }
 
     #[test]

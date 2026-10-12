@@ -137,12 +137,14 @@ fn open_database_for(ajax: &Ajax) -> anyhow::Result<Database> {
 
 fn print_retry_outcome(outcome: &RetryOutcome) {
     println!(
-        "failed tasks: {}, deleted: {}, resubmitted: {} (from db.sqlite: {}, from 115 api: {}), resubmit failures: {}",
+        "failed tasks: {}, restarted: {}, deleted: {}, resubmitted: {} (from db.sqlite: {}, from 115 api: {}), already existed: {}, resubmit failures: {}",
         outcome.failed_tasks,
+        outcome.restarted,
         outcome.deleted_tasks,
         outcome.resubmitted,
         outcome.from_database,
         outcome.from_api,
+        outcome.already_exists,
         outcome.resubmit_failures
     );
 }

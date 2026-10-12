@@ -20,6 +20,10 @@ use crate::{
 };
 
 const RSS_FETCH_CONCURRENCY: usize = 4;
+/// 调用 115 的重试接口 / 删除任务之后，等 115 处理完再去看结果的时间。
+const RETRY_SETTLE_DELAY: Duration = Duration::from_secs(3);
+/// 115 刚删除完任务时可能还会报“任务已存在”，重新提交的间隔。
+const ALREADY_EXISTS_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(3), Duration::from_secs(6)];
 
 #[derive(Debug, Clone, Copy)]
 pub struct RunOptions {
@@ -187,40 +191,75 @@ impl TaskRunner {
         .await
     }
 
-    /// 把 115 上失败的离线任务删掉再重新提交。
+    /// 重试 115 上失败的离线任务。
     ///
-    /// 连接在 `rss_items` 里有记录时，用数据库里保存的 `cid` / `savepath` 重新提交；
-    /// 数据库里没有记录时，用 115 任务列表返回的 `wp_path_id` 作为 `cid`。
+    /// 先用 115 官方的重试接口（`ac=restart`）逐个重试；如果接口报错、或者等了一会儿任务还是
+    /// 失败状态，就退回“先删除、再用数据库里的 `cid` / `savepath` 重新提交”的办法。
     pub async fn retry_failed_tasks(&self, service: &RssService) -> Result<RetryOutcome> {
         self.pan115.ensure_logged_in().await?;
-        let tasks = self.pan115.list_offline_tasks().await?;
-        let failed = collect_failed_tasks(tasks);
+        let failed = collect_failed_tasks(self.pan115.list_offline_tasks().await?);
         if failed.is_empty() {
             log::info!("[retry] no failed 115 offline task");
             return Ok(RetryOutcome::default());
         }
 
-        let magnets = failed
+        let mut outcome = RetryOutcome {
+            failed_tasks: failed.len(),
+            ..RetryOutcome::default()
+        };
+        log::info!("[retry] {} failed task(s)", outcome.failed_tasks);
+
+        // 1. 先用 115 官方的重试接口，能重启的任务不用删除重加。
+        let mut fallback = Vec::new();
+        for task in &failed {
+            match self.pan115.restart_offline_task(&task.info_hash).await {
+                Ok(()) => outcome.restarted += 1,
+                Err(err) => {
+                    log::warn!(
+                        "[retry] restart failed for {} ({}): {err}",
+                        task.name,
+                        task.info_hash
+                    );
+                    fallback.push(task.clone());
+                }
+            }
+        }
+
+        // 2. 过一会儿再确认任务有没有重新开始下载，没有的话退回删除 + 重新提交。
+        if outcome.restarted > 0 {
+            sleep(RETRY_SETTLE_DELAY).await;
+            let still_failed = collect_failed_tasks(self.pan115.list_offline_tasks().await?)
+                .into_iter()
+                .map(|task| task.info_hash)
+                .collect::<HashSet<_>>();
+            for task in &failed {
+                if still_failed.contains(&task.info_hash)
+                    && !fallback.iter().any(|item| item.info_hash == task.info_hash)
+                {
+                    log::warn!(
+                        "[retry] {} is still failed after restart, fall back to delete and re-add",
+                        task.name
+                    );
+                    fallback.push(task.clone());
+                }
+            }
+        }
+
+        if fallback.is_empty() {
+            return Ok(outcome);
+        }
+
+        // 3. 删除这些任务，再用 db.sqlite 里的 cid / savepath 重新提交。
+        let magnets = fallback
             .iter()
             .map(|task| canonicalize_magnet(&task.url))
             .collect::<Vec<_>>();
         let stored = service.find_items_by_magnets(&magnets)?;
-        let plans = build_retry_plans(&failed, &stored);
+        let plans = build_retry_plans(&fallback, &stored);
+        outcome.from_database = plans.iter().filter(|plan| plan.from_database).count();
+        outcome.from_api = plans.iter().filter(|plan| !plan.from_database).count();
 
-        let mut outcome = RetryOutcome {
-            failed_tasks: failed.len(),
-            from_database: plans.iter().filter(|plan| plan.from_database).count(),
-            from_api: plans.iter().filter(|plan| !plan.from_database).count(),
-            ..RetryOutcome::default()
-        };
-        log::info!(
-            "[retry] {} failed task(s): {} use db.sqlite, {} use 115 api",
-            outcome.failed_tasks,
-            outcome.from_database,
-            outcome.from_api
-        );
-
-        let hashes = failed
+        let hashes = fallback
             .iter()
             .map(|task| task.info_hash.clone())
             .collect::<Vec<_>>();
@@ -231,15 +270,28 @@ impl TaskRunner {
             sleep(self.options.chunk_delay).await;
         }
 
+        // 115 处理删除需要一点时间，等一会儿再重新提交，否则会报“任务已存在”。
+        sleep(RETRY_SETTLE_DELAY).await;
+
         for ((cid, savepath), group) in group_retry_plans(&plans) {
             for chunk in group.chunks(self.options.chunk_size) {
-                match submit_links_chunk(&self.pan115, chunk, cid.as_deref(), savepath.as_deref())
+                match self
+                    .resubmit_retry_chunk(chunk, cid.as_deref(), savepath.as_deref())
                     .await
                 {
-                    Ok(_) => {
+                    Ok(SubmitChunkOutcome::Added) => {
                         outcome.resubmitted += chunk.len();
                         log::info!(
                             "[retry] resubmitted {} task(s) with cid={:?} savepath={:?}",
+                            chunk.len(),
+                            cid,
+                            savepath
+                        );
+                    }
+                    Ok(SubmitChunkOutcome::TaskExisted) => {
+                        outcome.already_exists += chunk.len();
+                        log::warn!(
+                            "[retry] 115 still reports task existed for {} task(s) (cid={:?} savepath={:?}), 稍后可以再跑一次 --retry-failed",
                             chunk.len(),
                             cid,
                             savepath
@@ -255,6 +307,33 @@ impl TaskRunner {
         }
 
         Ok(outcome)
+    }
+
+    /// 重新提交一组连接。115 刚处理完删除时可能还会报“任务已存在”，隔一会儿再试几次。
+    async fn resubmit_retry_chunk(
+        &self,
+        links: &[String],
+        cid: Option<&str>,
+        savepath: Option<&str>,
+    ) -> Result<SubmitChunkOutcome> {
+        let max_attempts = ALREADY_EXISTS_RETRY_DELAYS.len() + 1;
+        for attempt in 1..=max_attempts {
+            match submit_links_chunk(&self.pan115, links, cid, savepath).await {
+                Ok(SubmitChunkOutcome::TaskExisted) if attempt < max_attempts => {
+                    let delay = ALREADY_EXISTS_RETRY_DELAYS[attempt - 1];
+                    log::warn!(
+                        "[retry] 115 still has these task(s) on attempt {}/{}, retry in {:?}",
+                        attempt,
+                        max_attempts,
+                        delay
+                    );
+                    sleep(delay).await;
+                }
+                result => return result,
+            }
+        }
+
+        unreachable!()
     }
 
     async fn execute_task(
@@ -410,8 +489,12 @@ async fn submit_links_chunk(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RetryOutcome {
     pub failed_tasks: usize,
+    /// 用 115 官方重试接口重新开始下载的任务数。
+    pub restarted: usize,
     pub deleted_tasks: usize,
     pub resubmitted: usize,
+    /// 115 仍然认为任务存在、没有重新提交的任务数。
+    pub already_exists: usize,
     pub from_database: usize,
     pub from_api: usize,
     pub resubmit_failures: usize,
