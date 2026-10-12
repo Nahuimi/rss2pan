@@ -21,8 +21,6 @@ const API_ADD_OFFLINE_URL: &str = "https://lixian.115.com/lixianssp/?ac=add_task
 const API_CLEAR_OFFLINE_URL: &str = "https://lixian.115.com/lixian/?ct=lixian&ac=task_clear";
 const API_LIST_OFFLINE_URL: &str = "https://lixian.115.com/lixian/?ct=lixian&ac=task_lists";
 const API_DELETE_OFFLINE_URL: &str = "https://lixian.115.com/lixian/?ct=lixian&ac=task_del";
-/// 115 官方的重试接口，可以直接让失败的离线任务重新开始下载。
-const API_RESTART_OFFLINE_URL: &str = "https://clouddownload.115.com/?ac=restart";
 const API_STATUS_CHECK: &str = "https://my.115.com/?ct=guide&ac=status";
 const API_USER_INFO: &str = "https://my.115.com/?ct=ajax&ac=nav";
 const API_QRCODE_TOKEN_URL: &str = "https://qrcodeapi.115.com/api/1.0/%s/1.0/token";
@@ -488,6 +486,13 @@ impl Pan115Client {
         Ok(())
     }
 
+    /// 清除 115 上所有失败的离线任务。
+    ///
+    /// 等价于 `--clear-task-type 3`：`task_clear` 的 `flag=2` 就是“已失败”。
+    pub async fn clear_failed_offline_tasks(&self) -> Result<()> {
+        self.clear_offline_tasks(2).await
+    }
+
     /// 分页拉取全部离线任务。
     pub async fn list_offline_tasks(&self) -> Result<Vec<OfflineTask>> {
         let mut tasks = Vec::new();
@@ -512,19 +517,6 @@ impl Pan115Client {
             page += 1;
         }
         Ok(tasks)
-    }
-
-    /// 让 115 重新下载一个失败的离线任务（115 官方的“重试”接口，不需要先删除任务）。
-    pub async fn restart_offline_task(&self, info_hash: &str) -> Result<()> {
-        let value = self
-            .request_json(
-                self.req(Method::POST, API_RESTART_OFFLINE_URL)?
-                    .form(&[("info_hash", info_hash)]),
-                API_RESTART_OFFLINE_URL,
-            )
-            .await?;
-        ensure_success(&value)?;
-        Ok(())
     }
 
     /// 按 `info_hash` 删除离线任务。`delete_files` 为 `true` 时会同时删除已下载的文件。

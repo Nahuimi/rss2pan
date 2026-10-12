@@ -78,7 +78,7 @@ rss2pan --rss custom-rss.json
 rss2pan -u "https://mikanani.me/RSS/Bangumi?bangumiId=2739&subgroupid=12"
 # --clear-task-type 清除离线任务。1: 已完成的 2: 所有任务 3: 失败任务 4: 运行的任务 5: 完成并删除的任务 6: 所有的任务
 rss2pan --clear-task-type 1
-# 重试失败的离线任务：先用 115 官方重试接口，不行再删除后用 db.sqlite 里的 cid/savepath 重新提交
+# 重试失败的离线任务：一次性清掉 115 上所有失败任务，再用 db.sqlite 里的 cid/savepath 重新提交
 rss2pan --retry-failed
 
 # 查看 magnet 子命令帮助
@@ -248,14 +248,14 @@ retention_months = 6
 
 `--retry-failed` 用来重试 115 上状态是失败（`status = -1`）的离线任务：
 
-1. 分页拉取 115 离线任务列表，筛出失败任务，按 `info_hash` 去重。
-2. 先用 115 官方的重试接口（`https://clouddownload.115.com/?ac=restart`，参数 `info_hash`）逐个重试；能重新开始下载的任务不用删除。
-3. 等几秒再拉一次任务列表，把“重试接口报错”和“重试后仍然是失败状态”的任务挑出来，退回删除 + 重新提交：
-   - 先用 `task_del` 逐个删除这些任务（`flag=0`，不删除已下载的文件），每次请求只带一个 `hash`，删完等几秒再提交，避免 115 还没处理完删除就报“任务已存在”。
+1. 分页拉取 115 离线任务列表里的全部任务，筛出失败任务，按 `info_hash` 去重。
+2. 用 `task_clear` 的 `flag=2`（就是 `--clear-task-type 3`）**一次性清掉 115 上所有失败任务**；这个请求失败时才退回逐个 `task_del`（每个请求只带一个 `hash`，`flag=0` 不删除已下载文件）。
+3. 等 3 秒，再拉一次任务列表确认失败任务是不是真的没了；如果还有残留会在日志里告警，并在最后打印 `still failed` 数量。
+4. 重新提交这些连接：
    - 连接在 `db.sqlite` 的 `rss_items` 里有记录时，使用记录里的 `cid` 和 `savepath`（记录里没有 `savepath` 就不传；记录里没有 `cid` 时退回用 115 返回的 `wp_path_id`）。
    - 数据库里没有记录时，使用 115 任务列表返回的 `wp_path_id` 作为 `cid`，不带 `savepath`。
-   - 如果 115 仍然返回“任务已存在”，会隔几秒重试两次；还是存在就只记一条警告并计入 `already existed`，不再算提交失败。
-4. 同一组 `cid` / `savepath` 的连接会合并成一次 `add_task_urls` 请求，分块大小和间隔仍然由 `--chunk-size`、`--chunk-delay` 控制。
+   - 如果 115 仍然返回“任务已存在”，会隔 3 秒、6 秒各重试一次；还是存在就只记一条警告并计入 `already existed`，不再算提交失败。
+5. 同一组 `cid` / `savepath` 的连接会合并成一次 `add_task_urls` 请求，分块大小和间隔仍然由 `--chunk-size`、`--chunk-delay` 控制。
 
 ```bash
 # 重试失败的离线任务
@@ -265,8 +265,8 @@ rss2pan --retry-failed --chunk-size 50 --chunk-delay 3
 ```
 
 - `--retry-failed` 和 `--clear-task-type` 不能同时使用。
-- 结束后会打印失败任务数、用重试接口重启的任务数、删除数、重新提交数（分别来自 `db.sqlite` 和 115 API）、115 仍认为存在的任务数以及提交失败数；有提交失败时退出码是 `1`。
-- 如果 `already existed` 不为 0，说明 115 还在用它自己的“重复链接”校验挡住这些连接，稍后再跑一次 `--retry-failed`，或者先用 `--clear-task-type 3` 清掉 115 里的失败任务（对应 `task_clear` 的 `flag=2`）。
+- 结束后会打印失败任务数、清除数、仍然失败数、重新提交数（分别来自 `db.sqlite` 和 115 API）、115 仍认为存在的任务数以及提交失败数；有提交失败时退出码是 `1`。
+- 如果 `already existed` 不为 0，说明 115 还在用它自己的“重复链接”校验挡住这些连接，稍后再跑一次 `--retry-failed` 就行。
 - 数据库里没有记录的重试**不会**写回 `db.sqlite`。
 
 #### 代理配置

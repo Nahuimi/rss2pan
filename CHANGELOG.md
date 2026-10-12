@@ -4,14 +4,14 @@
 
 - 黑名单合并进 `db.sqlite`，不再单独使用 `blacklist.sqlite`；首次打开数据库时会自动导入旧文件并改名为 `blacklist.sqlite.bak`
 - `rss_items` 表新增 `cid`、`savepath` 两列，记录每条连接离线时使用的参数
-- 新增 `--retry-failed`：先调用 115 官方的重试接口（`clouddownload.115.com/?ac=restart`）重新开始下载失败任务；接口报错或重试后仍然失败的任务再删除，并用 `db.sqlite` 里的 `cid`/`savepath` 重新提交，数据库里没有记录时使用 115 返回的 `wp_path_id`
+- 新增 `--retry-failed`：一次拉取全部离线任务，用 `task_clear(flag=2)`（同 `--clear-task-type 3`）一次性清掉 115 上所有失败任务，再用 `db.sqlite` 里的 `cid`/`savepath` 重新提交，数据库里没有记录时使用 115 返回的 `wp_path_id`
 
 ## 修复
 
-- `task_del` 一次只带一个 `hash`：之前一次请求带多个 `hash` 时 115 只会删掉其中一个，导致剩下没删掉的任务重新提交时报“任务已存在”
+- `task_del` 一次只带一个 `hash`：之前一次请求带多个 `hash` 时 115 只会删掉其中一个，导致剩下没删掉的任务重新提交时报“任务已存在”；现在 `--retry-failed` 主要走 `task_clear` 一次性清除，只有它失败时才逐个 `task_del`
 - 115 用 `errno = 0` + `state = false` 返回的「任务已存在，请勿输入重复的链接地址」现在按“任务已存在”处理，不再算作未知错误
-- `--retry-failed` 重新提交前会等 115 处理完删除；遇到仍然报“任务已存在”时先隔几秒重试两次，仍存在只记警告并计入 `already existed`，不再算提交失败
-- 删除失败任务之后会重新拉一次任务列表，日志会显示 115 是否真的把任务删掉了
+- 清除失败任务之后会重新拉一次任务列表，日志和最后的 `still failed` 会显示 115 是否真的把任务清掉了
+- `--retry-failed` 遇到 115 报“任务已存在”时会隔 3 秒、6 秒各重试一次，仍存在只记警告并计入 `already existed`，不再算提交失败
 
 - 连接被对端断开（HTTP/2 的 `stream closed because of a broken pipe`、HTTP/1.1 的 `connection closed before message completed` 等）现在按瞬时错误处理：RSS 抓取会重试，重试仍失败时只跳过该 RSS 源；115 API 请求也会重试，不再因为一次断连中断整个任务
 
