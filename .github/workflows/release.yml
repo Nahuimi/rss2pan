@@ -23,7 +23,7 @@ permissions:
 jobs:
   validate:
     if: github.event_name == 'push'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
@@ -46,7 +46,7 @@ jobs:
 
   create-tag:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:
@@ -98,7 +98,7 @@ jobs:
   release:
     if: github.event_name == 'push'
     needs: validate
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
@@ -119,9 +119,9 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-24.04
+            os: ubuntu-latest
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-24.04
+            os: ubuntu-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
           - target: x86_64-apple-darwin
