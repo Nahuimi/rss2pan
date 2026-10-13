@@ -21,8 +21,8 @@ permissions:
   packages: write
 
 jobs:
+  # 两种触发方式都跑：push tag 时校验 tag 指向的代码，手动发布时校验 main 的最新提交。
   validate:
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -44,9 +44,13 @@ jobs:
       - name: Run tests
         run: cargo test
 
+  # 手动触发时先建/移动 tag；随后 release、upload-assets 在本次运行里继续。
   create-tag:
     if: github.event_name == 'workflow_dispatch'
+    needs: validate
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.prepare.outputs.tag }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -89,15 +93,18 @@ jobs:
             git push origin "refs/tags/$tag"
           fi
 
-      - name: Wait for tag-triggered release run
+      - name: Tag ready
         shell: bash
         run: |
           echo "tag ${{ steps.prepare.outputs.tag }} has been pushed."
-          echo "The publish workflow will continue in the tag-triggered run."
+          echo "release and upload-assets continue in this same workflow run."
 
   release:
-    if: github.event_name == 'push'
-    needs: validate
+    # create-tag 在 push tag 触发时会被跳过，所以这里用 always() 兜住。
+    if: always() && needs.validate.result == 'success' && (github.event_name == 'push' || needs.create-tag.result == 'success')
+    needs:
+      - validate
+      - create-tag
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -105,15 +112,16 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
+          tag_name: ${{ needs.create-tag.outputs.tag || github.ref_name }}
+          name: ${{ needs.create-tag.outputs.tag || github.ref_name }}
           target_commitish: ${{ github.sha }}
           body_path: ./CHANGELOG.md
 
   upload-assets:
-    if: github.event_name == 'push'
+    if: always() && needs.release.result == 'success'
     needs:
       - validate
+      - create-tag
       - release
     strategy:
       matrix:
@@ -130,7 +138,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: refs/tags/${{ github.ref_name }}
+          ref: refs/tags/${{ needs.create-tag.outputs.tag || github.ref_name }}
 
       - name: Prepare Linux toolchain for wreq
         if: runner.os == 'Linux'
@@ -184,7 +192,7 @@ jobs:
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: rss2pan
-          ref: refs/tags/${{ github.ref_name }}
+          ref: refs/tags/${{ needs.create-tag.outputs.tag || github.ref_name }}
           target: ${{ matrix.target }}
           tar: unix
           zip: windows
