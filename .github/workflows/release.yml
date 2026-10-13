@@ -109,13 +109,47 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Extract release notes for this tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.create-tag.outputs.tag || github.ref_name }}"
+          python3 - "$tag" <<'PY'
+          import sys
+          from pathlib import Path
+
+          tag = sys.argv[1]
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          heading = f"# {tag}"
+
+          body = []
+          collecting = False
+          for line in changelog.splitlines():
+              if line.startswith("# "):
+                  if collecting:
+                      break
+                  collecting = line.strip() == heading
+                  continue
+              if collecting:
+                  body.append(line)
+
+          text = "\n".join(body).strip()
+          if not text:
+              print(f"warning: CHANGELOG.md has no '{heading}' section, using the whole file", file=sys.stderr)
+              text = changelog.strip()
+
+          Path("release-notes.md").write_text(text + "\n", encoding="utf-8")
+          print("----- release notes -----")
+          print(text)
+          PY
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.create-tag.outputs.tag || github.ref_name }}
           name: ${{ needs.create-tag.outputs.tag || github.ref_name }}
           target_commitish: ${{ github.sha }}
-          body_path: ./CHANGELOG.md
+          body_path: ./release-notes.md
 
   upload-assets:
     if: always() && needs.release.result == 'success'

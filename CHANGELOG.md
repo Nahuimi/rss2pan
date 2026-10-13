@@ -1,5 +1,7 @@
 # Unreleased
 
+# v0.2.4
+
 ## 变化
 
 - 黑名单合并进 `db.sqlite`，不再单独使用 `blacklist.sqlite`；首次打开数据库时会自动导入旧文件并改名为 `blacklist.sqlite.bak`
