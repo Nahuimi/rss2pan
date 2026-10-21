@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::ArgMatches;
 use futures::{stream, StreamExt};
 use regex::Regex;
@@ -12,18 +12,21 @@ use tokio::time::sleep;
 
 use crate::{
     db::{BlacklistService, RssService, StoredRssItem},
+    failed_tasks::{self, FailedSubmit},
     pan115::{OfflineTask, Pan115Client, Pan115Error, Pan115ErrorKind},
     request::Ajax,
     rss_config::{get_rss_config_by_url, get_rss_list, RssConfig},
     rss_site::{get_magnetitem_list, is_retry_exhausted_rss_error, MagnetItem},
-    utils::canonicalize_magnet,
+    utils::{canonicalize_magnet, current_beijing_rfc3339},
 };
 
 const RSS_FETCH_CONCURRENCY: usize = 4;
+/// 115 单次 `add_task_urls` 最多接受的链接数，超过要分批次提交。
+pub const MAX_LINKS_PER_SUBMIT: usize = crate::pan115::MAX_ADD_LINKS_PER_REQUEST;
+/// 提交失败后的重试间隔。115 偶尔会瞬时失败；任务刚删除时也可能暂时报“任务已存在”。
+const SUBMIT_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(3), Duration::from_secs(6)];
 /// 调用 115 的重试接口 / 删除任务之后，等 115 处理完再去看结果的时间。
 const RETRY_SETTLE_DELAY: Duration = Duration::from_secs(3);
-/// 115 刚删除完任务时可能还会报“任务已存在”，重新提交的间隔。
-const ALREADY_EXISTS_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(3), Duration::from_secs(6)];
 
 #[derive(Debug, Clone, Copy)]
 pub struct RunOptions {
@@ -36,7 +39,7 @@ impl Default for RunOptions {
     fn default() -> Self {
         Self {
             disable_cache: false,
-            chunk_size: 200,
+            chunk_size: MAX_LINKS_PER_SUBMIT,
             chunk_delay: Duration::from_secs(2),
         }
     }
@@ -52,12 +55,17 @@ impl RunOptions {
             ..Self::default()
         };
         if let Some(chunk_size) = matches.get_one::<usize>("chunk-size").copied() {
-            options.chunk_size = chunk_size.max(1);
+            options.chunk_size = chunk_size.clamp(1, MAX_LINKS_PER_SUBMIT);
         }
         if let Some(chunk_delay) = matches.get_one::<u64>("chunk-delay").copied() {
             options.chunk_delay = Duration::from_secs(chunk_delay);
         }
         options
+    }
+
+    /// 实际提交时每批的链接数，永远不超过 115。
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size.clamp(1, MAX_LINKS_PER_SUBMIT)
     }
 }
 
@@ -242,7 +250,7 @@ impl TaskRunner {
                 log::warn!(
                     "[retry] clear failed task(s) failed ({err}), deleting one by one instead"
                 );
-                for chunk in hashes.chunks(self.options.chunk_size) {
+                for chunk in hashes.chunks(self.options.chunk_size()) {
                     self.pan115.delete_offline_tasks(chunk, false).await?;
                     outcome.deleted_tasks += chunk.len();
                     log::info!("[retry] deleted {} failed task(s)", chunk.len());
@@ -268,11 +276,16 @@ impl TaskRunner {
         }
 
         // 4. 用 db.sqlite 里的 cid / savepath 重新提交。
+        let mut failures = Vec::new();
         for ((cid, savepath), group) in group_retry_plans(&plans) {
-            for chunk in group.chunks(self.options.chunk_size) {
-                match self
-                    .resubmit_retry_chunk(chunk, cid.as_deref(), savepath.as_deref())
-                    .await
+            for chunk in group.chunks(self.options.chunk_size()) {
+                match submit_chunk_with_retry(
+                    &self.pan115,
+                    chunk,
+                    cid.as_deref(),
+                    savepath.as_deref(),
+                )
+                .await
                 {
                     Ok(SubmitChunkOutcome::Added) => {
                         outcome.resubmitted += chunk.len();
@@ -294,13 +307,138 @@ impl TaskRunner {
                     }
                     Err(err) => {
                         outcome.resubmit_failures += chunk.len();
-                        log::warn!("[retry] resubmit failed: {err}");
+                        log::warn!("[retry] resubmit failed after retries: {err}");
+                        failures.push(FailedSubmit::new(
+                            "[retry]",
+                            cid.clone(),
+                            savepath.clone(),
+                            format!("{err:#}"),
+                            chunk.to_vec(),
+                        ));
                     }
                 }
                 sleep(self.options.chunk_delay).await;
             }
         }
 
+        if !failures.is_empty() {
+            outcome.failed_json_path = Some(self.record_failed_submits(&failures)?);
+        }
+
+        Ok(outcome)
+    }
+
+    /// 重试 `failed_tasks.json` 里记录的失败链接。
+    ///
+    /// 提交成功（含 115 报“任务已存在”）的链接会从文件里删除；仍然失败的链接保留并更新错误信息。
+    pub async fn retry_failed_json(&self, path: Option<PathBuf>) -> Result<RetryJsonOutcome> {
+        let path =
+            path.unwrap_or_else(|| failed_tasks::path_for_database(&self.pan115.database_path()));
+        let mut file = failed_tasks::read(&path)?;
+        let mut outcome = RetryJsonOutcome {
+            file_path: path.clone(),
+            entries: file.failures.len(),
+            links: file.link_count(),
+            ..RetryJsonOutcome::default()
+        };
+        if file.is_empty() {
+            log::info!("[retry-json] no failed link in {}", path.display());
+            return Ok(outcome);
+        }
+
+        self.pan115.ensure_logged_in().await?;
+        log::info!(
+            "[retry-json] retry {} failed link(s) from {} entry/entries in {}",
+            outcome.links,
+            outcome.entries,
+            path.display()
+        );
+
+        let chunk_size = self.options.chunk_size();
+        let mut remaining = Vec::new();
+        let mut fatal = false;
+        for failure in file.failures.drain(..) {
+            if fatal {
+                remaining.push(failure);
+                continue;
+            }
+
+            let mut pending_links = Vec::new();
+            let mut last_error = failure.error.clone();
+            for chunk in failure.links.chunks(chunk_size) {
+                if fatal {
+                    pending_links.extend_from_slice(chunk);
+                    continue;
+                }
+                match submit_chunk_with_retry(
+                    &self.pan115,
+                    chunk,
+                    failure.cid.as_deref(),
+                    failure.savepath.as_deref(),
+                )
+                .await
+                {
+                    Ok(SubmitChunkOutcome::Added) => {
+                        outcome.resubmitted += chunk.len();
+                        log::info!(
+                            "[retry-json] resubmitted {} link(s) with cid={:?} savepath={:?}",
+                            chunk.len(),
+                            failure.cid,
+                            failure.savepath
+                        );
+                    }
+                    Ok(SubmitChunkOutcome::TaskExisted) => {
+                        outcome.already_exists += chunk.len();
+                        log::warn!(
+                            "[retry-json] 115 still reports task existed for {} link(s) (cid={:?} savepath={:?}), treating as added",
+                            chunk.len(),
+                            failure.cid,
+                            failure.savepath
+                        );
+                    }
+                    Err(err) => {
+                        last_error = format!("{err:#}");
+                        pending_links.extend_from_slice(chunk);
+                        log::warn!("[retry-json] submit failed after retries: {err}");
+                        if is_fatal_submit_error(&err) {
+                            fatal = true;
+                        }
+                    }
+                }
+                sleep(self.options.chunk_delay).await;
+            }
+
+            if !pending_links.is_empty() {
+                remaining.push(FailedSubmit {
+                    created_at: failure.created_at,
+                    source: failure.source,
+                    cid: failure.cid,
+                    savepath: failure.savepath,
+                    error: last_error,
+                    links: pending_links,
+                });
+            }
+        }
+
+        file.updated_at = current_beijing_rfc3339();
+        file.failures = remaining;
+        failed_tasks::write(&path, &file)?;
+        outcome.still_failed = file.link_count();
+        outcome.remaining_entries = file.failures.len();
+        log::info!(
+            "[retry-json] done: {} resubmitted, {} already existed, {} still failed in {} entry/entries, saved to {}",
+            outcome.resubmitted,
+            outcome.already_exists,
+            outcome.still_failed,
+            outcome.remaining_entries,
+            path.display()
+        );
+        if fatal {
+            log::error!(
+                "[retry-json] stopped retrying remaining entries after a fatal 115 error; they stay in {}",
+                path.display()
+            );
+        }
         Ok(outcome)
     }
 
@@ -313,31 +451,9 @@ impl TaskRunner {
             .count())
     }
 
-    /// 重新提交一组连接。115 刚处理完删除时可能还会报“任务已存在”，隔一会儿再试几次。
-    async fn resubmit_retry_chunk(
-        &self,
-        links: &[String],
-        cid: Option<&str>,
-        savepath: Option<&str>,
-    ) -> Result<SubmitChunkOutcome> {
-        let max_attempts = ALREADY_EXISTS_RETRY_DELAYS.len() + 1;
-        for attempt in 1..=max_attempts {
-            match submit_links_chunk(&self.pan115, links, cid, savepath).await {
-                Ok(SubmitChunkOutcome::TaskExisted) if attempt < max_attempts => {
-                    let delay = ALREADY_EXISTS_RETRY_DELAYS[attempt - 1];
-                    log::warn!(
-                        "[retry] 115 still has these task(s) on attempt {}/{}, retry in {:?}",
-                        attempt,
-                        max_attempts,
-                        delay
-                    );
-                    sleep(delay).await;
-                }
-                result => return result,
-            }
-        }
-
-        unreachable!()
+    /// 把失败的批次写进 `failed_tasks.json`，返回文件路径。
+    fn record_failed_submits(&self, failures: &[FailedSubmit]) -> Result<PathBuf> {
+        record_failed_submits(&self.pan115, failures)
     }
 
     async fn execute_task(
@@ -385,13 +501,15 @@ impl TaskRunner {
             return Ok(());
         }
 
-        let total_chunks = chunk_count(tasks.len(), self.options.chunk_size);
-        for (index, chunk) in tasks.chunks(self.options.chunk_size).enumerate() {
+        let chunk_size = self.options.chunk_size();
+        let total_chunks = chunk_count(tasks.len(), chunk_size);
+        let mut failures = Vec::new();
+        for (index, chunk) in tasks.chunks(chunk_size).enumerate() {
             let links = chunk
                 .iter()
                 .map(|item| item.magnet.clone())
                 .collect::<Vec<_>>();
-            match submit_links_chunk(
+            match submit_chunk_with_retry(
                 &self.pan115,
                 &links,
                 config.cid.as_deref(),
@@ -422,15 +540,41 @@ impl TaskRunner {
                         config.savepath.as_deref(),
                     )?;
                 }
-                Err(err) if matches!(classify_add_error(&err), AddErrorAction::FailInvalidLink) => {
-                    log::warn!("[{}] wrong links", config_name_or_url(config));
-                    return Err(err);
+                Err(err) => {
+                    log::warn!(
+                        "[{}] add {} task(s) failed after retries: {err}",
+                        config_name_or_url(config),
+                        chunk.len()
+                    );
+                    failures.push(FailedSubmit::new(
+                        config_name_or_url(config),
+                        config.cid.clone(),
+                        config.savepath.clone(),
+                        format!("{err:#}"),
+                        links,
+                    ));
+                    if is_fatal_submit_error(&err) {
+                        log::error!(
+                            "[{}] stop submitting remaining chunks: {err}",
+                            config_name_or_url(config)
+                        );
+                        break;
+                    }
                 }
-                Err(err) => return Err(err),
             }
             if index + 1 < total_chunks {
                 sleep(self.options.chunk_delay).await;
             }
+        }
+
+        if !failures.is_empty() {
+            let path = self.record_failed_submits(&failures)?;
+            bail!(
+                "[{}] {} batch(es) failed to submit, failed links saved to {}",
+                config_name_or_url(config),
+                failures.len(),
+                path.display()
+            );
         }
 
         blacklist_matched_rss(blacklist, config, blacklist_candidate.as_ref())?;
@@ -446,26 +590,66 @@ pub async fn submit_links_with_options(
     cid: Option<&str>,
     savepath: Option<&str>,
 ) -> Result<()> {
-    let total_chunks = chunk_count(links.len(), options.chunk_size);
-    for (index, chunk) in links.chunks(options.chunk_size).enumerate() {
-        match submit_links_chunk(pan115, chunk, cid, savepath).await {
+    let chunk_size = options.chunk_size();
+    let total_chunks = chunk_count(links.len(), chunk_size);
+    let mut failures = Vec::new();
+    for (index, chunk) in links.chunks(chunk_size).enumerate() {
+        match submit_chunk_with_retry(pan115, chunk, cid, savepath).await {
             Ok(SubmitChunkOutcome::Added) => {
                 log::info!("{label} add {} tasks", chunk.len());
             }
             Ok(SubmitChunkOutcome::TaskExisted) => {
                 log::warn!("{label} task exist");
             }
-            Err(err) if matches!(classify_add_error(&err), AddErrorAction::FailInvalidLink) => {
-                log::warn!("{label} wrong links");
-                return Err(err);
+            Err(err) => {
+                log::warn!(
+                    "{label} add {} task(s) failed after retries: {err}",
+                    chunk.len()
+                );
+                failures.push(FailedSubmit::new(
+                    label,
+                    cid.map(str::to_string),
+                    savepath.map(str::to_string),
+                    format!("{err:#}"),
+                    chunk.to_vec(),
+                ));
+                if is_fatal_submit_error(&err) {
+                    log::error!("{label} stop submitting remaining chunks: {err}");
+                    break;
+                }
             }
-            Err(err) => return Err(err),
         }
         if index + 1 < total_chunks {
             sleep(options.chunk_delay).await;
         }
     }
-    Ok(())
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        let path = record_failed_submits(pan115, &failures)?;
+        bail!(
+            "{label} {} batch(es) failed to submit, failed links saved to {}",
+            failures.len(),
+            path.display()
+        );
+    }
+}
+
+/// 把失败的批次写进 `failed_tasks.json`，返回文件路径。
+fn record_failed_submits(pan115: &Pan115Client, failures: &[FailedSubmit]) -> Result<PathBuf> {
+    let path = failed_tasks::path_for_database(&pan115.database_path());
+    failed_tasks::append(&path, failures)?;
+    log::error!(
+        "[failed] {} batch(es) / {} link(s) failed to submit, saved to {}",
+        failures.len(),
+        failures
+            .iter()
+            .map(|failure| failure.links.len())
+            .sum::<usize>(),
+        path.display()
+    );
+    Ok(path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -489,8 +673,64 @@ async fn submit_links_chunk(
     }
 }
 
+/// 提交一批链接；瞬时失败和“任务已存在”会隔一会儿再重试。
+async fn submit_chunk_with_retry(
+    pan115: &Pan115Client,
+    links: &[String],
+    cid: Option<&str>,
+    savepath: Option<&str>,
+) -> Result<SubmitChunkOutcome> {
+    let max_attempts = SUBMIT_RETRY_DELAYS.len() + 1;
+    for attempt in 1..=max_attempts {
+        match submit_links_chunk(pan115, links, cid, savepath).await {
+            Ok(SubmitChunkOutcome::TaskExisted) if attempt < max_attempts => {
+                let delay = SUBMIT_RETRY_DELAYS[attempt - 1];
+                log::warn!(
+                    "115 still reports task existed for {} task(s) on attempt {}/{}, retry in {:?}",
+                    links.len(),
+                    attempt,
+                    max_attempts,
+                    delay
+                );
+                sleep(delay).await;
+            }
+            Ok(outcome) => return Ok(outcome),
+            Err(err) if attempt < max_attempts && should_retry_submit(&err) => {
+                let delay = SUBMIT_RETRY_DELAYS[attempt - 1];
+                log::warn!(
+                    "submit {} task(s) failed on attempt {}/{}: {err}, retry in {:?}",
+                    links.len(),
+                    attempt,
+                    max_attempts,
+                    delay
+                );
+                sleep(delay).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    unreachable!()
+}
+
+/// 115 瞬时失败或网络错误可以再试一次；登录失效、没有离线次数、链接非法重试也没用。
+fn should_retry_submit(err: &anyhow::Error) -> bool {
+    matches!(
+        add_error_kind(err),
+        None | Some(Pan115ErrorKind::Unexpected)
+    )
+}
+
+/// 登录失效、离线次数用完时继续提交剩下的批次没有意义。
+fn is_fatal_submit_error(err: &anyhow::Error) -> bool {
+    matches!(
+        add_error_kind(err),
+        Some(Pan115ErrorKind::NotLogin | Pan115ErrorKind::OfflineNoTimes)
+    )
+}
+
 /// 重试失败离线任务的结果统计。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetryOutcome {
     pub failed_tasks: usize,
     pub deleted_tasks: usize,
@@ -502,11 +742,33 @@ pub struct RetryOutcome {
     pub from_database: usize,
     pub from_api: usize,
     pub resubmit_failures: usize,
+    /// 仍有链接提交失败时，`failed_tasks.json` 的路径。
+    pub failed_json_path: Option<PathBuf>,
 }
 
 impl RetryOutcome {
     pub fn is_success(&self) -> bool {
         self.resubmit_failures == 0
+    }
+}
+
+/// 重试 `failed_tasks.json` 的结果统计。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetryJsonOutcome {
+    pub file_path: PathBuf,
+    /// 文件里原本的记录条数和链接数。
+    pub entries: usize,
+    pub links: usize,
+    pub resubmitted: usize,
+    pub already_exists: usize,
+    /// 重试后仍然失败、保留下来的链接数。
+    pub still_failed: usize,
+    pub remaining_entries: usize,
+}
+
+impl RetryJsonOutcome {
+    pub fn is_success(&self) -> bool {
+        self.still_failed == 0
     }
 }
 
@@ -750,6 +1012,62 @@ mod tests {
     }
 
     #[test]
+    fn test_run_options_chunk_size_never_exceeds_115() {
+        assert_eq!(RunOptions::default().chunk_size(), MAX_LINKS_PER_SUBMIT);
+        assert_eq!(
+            RunOptions {
+                chunk_size: 500,
+                ..RunOptions::default()
+            }
+            .chunk_size(),
+            MAX_LINKS_PER_SUBMIT
+        );
+        assert_eq!(
+            RunOptions {
+                chunk_size: 0,
+                ..RunOptions::default()
+            }
+            .chunk_size(),
+            1
+        );
+        assert_eq!(
+            RunOptions {
+                chunk_size: 50,
+                ..RunOptions::default()
+            }
+            .chunk_size(),
+            50
+        );
+    }
+
+    #[test]
+    fn test_chunk_count_splits_more_than_115_links() {
+        assert_eq!(chunk_count(115, MAX_LINKS_PER_SUBMIT), 1);
+        assert_eq!(chunk_count(116, MAX_LINKS_PER_SUBMIT), 2);
+        assert_eq!(chunk_count(215, MAX_LINKS_PER_SUBMIT), 2);
+        assert_eq!(chunk_count(1000, MAX_LINKS_PER_SUBMIT), 9);
+    }
+
+    #[test]
+    fn test_should_retry_submit_only_for_transient_errors() {
+        assert!(should_retry_submit(&Pan115Error::new(99999, None).into()));
+        assert!(should_retry_submit(&anyhow!("network reset")));
+        assert!(!should_retry_submit(&Pan115Error::new(10004, None).into()));
+        assert!(!should_retry_submit(&Pan115Error::new(10010, None).into()));
+        assert!(!should_retry_submit(&Pan115Error::new(99, None).into()));
+    }
+
+    #[test]
+    fn test_is_fatal_submit_error_only_for_login_and_quota() {
+        assert!(is_fatal_submit_error(&Pan115Error::new(99, None).into()));
+        assert!(is_fatal_submit_error(&Pan115Error::new(10010, None).into()));
+        assert!(!is_fatal_submit_error(
+            &Pan115Error::new(99999, None).into()
+        ));
+        assert!(!is_fatal_submit_error(&anyhow!("network reset")));
+    }
+
+    #[test]
     fn test_dedup_task_items_normalizes_and_deduplicates() {
         let (items, empty_num) = dedup_task_items(&[
             magnet_item("magnet:?xt=URN:BTIH:ABC123&dn=foo"),
@@ -937,5 +1255,24 @@ mod tests {
             ..RetryOutcome::default()
         }
         .is_success());
+    }
+
+    #[test]
+    fn test_retry_json_outcome_is_success_only_without_failures() {
+        assert!(RetryJsonOutcome::default().is_success());
+        assert!(!RetryJsonOutcome {
+            still_failed: 1,
+            ..RetryJsonOutcome::default()
+        }
+        .is_success());
+    }
+
+    #[test]
+    fn test_submit_limit_constant_matches_115_api_limit() {
+        assert_eq!(MAX_LINKS_PER_SUBMIT, 115);
+        assert_eq!(
+            MAX_LINKS_PER_SUBMIT,
+            crate::pan115::MAX_ADD_LINKS_PER_REQUEST
+        );
     }
 }

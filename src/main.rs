@@ -1,6 +1,7 @@
 mod app;
 mod db;
 mod downloader;
+mod failed_tasks;
 mod m115;
 mod pan115;
 mod request;
@@ -16,7 +17,7 @@ use app::build_app;
 use db::Database;
 use pan115::Pan115Client;
 use request::{ensure_default_config_file, load_default_app_config, Ajax, AppConfig};
-use runner::{RetryOutcome, RunOptions, TaskRunner};
+use runner::{RetryJsonOutcome, RetryOutcome, RunOptions, TaskRunner};
 use utils::get_magnet_list_by_txt;
 
 #[tokio::main]
@@ -45,19 +46,42 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if matches.get_one::<bool>("retry-failed").copied() == Some(true) {
-        let database = open_database_for(&ajax)?;
-        match runner.retry_failed_tasks(&database.rss).await {
-            Ok(outcome) => {
-                print_retry_outcome(&outcome);
-                if !outcome.is_success() {
+    let retry_failed = matches.get_one::<bool>("retry-failed").copied() == Some(true);
+    let retry_failed_json = matches
+        .get_one::<String>("retry-failed-json")
+        .map(|value| (!value.is_empty()).then(|| PathBuf::from(value)));
+    if retry_failed || retry_failed_json.is_some() {
+        let mut failed = false;
+
+        if retry_failed {
+            let database = open_database_for(&ajax)?;
+            match runner.retry_failed_tasks(&database.rss).await {
+                Ok(outcome) => {
+                    print_retry_outcome(&outcome);
+                    failed |= !outcome.is_success();
+                }
+                Err(err) => {
+                    print_error(&err);
                     std::process::exit(1);
                 }
             }
-            Err(err) => {
-                print_error(&err);
-                std::process::exit(1);
+        }
+
+        if let Some(path) = retry_failed_json {
+            match runner.retry_failed_json(path).await {
+                Ok(outcome) => {
+                    print_retry_json_outcome(&outcome);
+                    failed |= !outcome.is_success();
+                }
+                Err(err) => {
+                    print_error(&err);
+                    std::process::exit(1);
+                }
             }
+        }
+
+        if failed {
+            std::process::exit(1);
         }
         return Ok(());
     }
@@ -146,6 +170,22 @@ fn print_retry_outcome(outcome: &RetryOutcome) {
         outcome.from_api,
         outcome.already_exists,
         outcome.resubmit_failures
+    );
+    if let Some(path) = &outcome.failed_json_path {
+        println!("failed links saved to: {}", path.display());
+    }
+}
+
+fn print_retry_json_outcome(outcome: &RetryJsonOutcome) {
+    println!(
+        "failed json: {}, entries: {}, links: {}, resubmitted: {}, already existed: {}, still failed: {}, remaining entries: {}",
+        outcome.file_path.display(),
+        outcome.entries,
+        outcome.links,
+        outcome.resubmitted,
+        outcome.already_exists,
+        outcome.still_failed,
+        outcome.remaining_entries
     );
 }
 

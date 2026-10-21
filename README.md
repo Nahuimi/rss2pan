@@ -25,6 +25,8 @@ RSS 站点抓取已从 `reqwest` 切换到 `wreq`，并针对 Cloudflare Worker 
 - [x] `--no-cache`
 - [x] `--clear-task-type`
 - [x] `--retry-failed` 重试失败的离线任务
+- [x] `--retry-failed-json` 重试 `failed_tasks.json` 里记录的失败链接
+- [x] 提交失败的链接写入 `failed_tasks.json`（含 `cid` / `savepath`）
 - [x] `--chunk-delay`
 - [x] `--chunk-size`
 - [x] `config.toml` 代理 / 站点 / cookie 配置
@@ -68,6 +70,7 @@ rss2pan -q --qrcode-app 115android
 # 跳过 db.sqlite 缓存检查
 rss2pan --no-cache
 # 调整分块大小和间隔
+# 115 的离线接口单次最多接受 115 条链接，超过时程序会自动分批
 rss2pan --chunk-size 100 --chunk-delay 3
 
 # 指定 rss 配置文件路径；优先级高于 config.toml 里的 [paths].rss
@@ -80,6 +83,10 @@ rss2pan -u "https://mikanani.me/RSS/Bangumi?bangumiId=2739&subgroupid=12"
 rss2pan --clear-task-type 1
 # 重试失败的离线任务：一次性清掉 115 上所有失败任务，再用 db.sqlite 里的 cid/savepath 重新提交
 rss2pan --retry-failed
+# 重试 failed_tasks.json 里记录的失败链接（默认读 db.sqlite 旁的 failed_tasks.json）
+rss2pan --retry-failed-json
+# 指定失败记录文件
+rss2pan --retry-failed-json custom-failed_tasks.json
 
 # 查看 magnet 子命令帮助
 rss2pan magnet -h
@@ -255,7 +262,8 @@ retention_months = 6
    - 连接在 `db.sqlite` 的 `rss_items` 里有记录时，使用记录里的 `cid` 和 `savepath`（记录里没有 `savepath` 就不传；记录里没有 `cid` 时退回用 115 返回的 `wp_path_id`）。
    - 数据库里没有记录时，使用 115 任务列表返回的 `wp_path_id` 作为 `cid`，不带 `savepath`。
    - 如果 115 仍然返回“任务已存在”，会隔 3 秒、6 秒各重试一次；还是存在就只记一条警告并计入 `already existed`，不再算提交失败。
-5. 同一组 `cid` / `savepath` 的连接会合并成一次 `add_task_urls` 请求，分块大小和间隔仍然由 `--chunk-size`、`--chunk-delay` 控制。
+   - 提交时遇到瞬时错误也会重试 2 次；最终仍失败的链接写入 `failed_tasks.json`。
+5. 同一组 `cid` / `savepath` 的连接会合并成一次 `add_task_urls` 请求，每批最多 115 条（`--chunk-size` 超过 115 时按 115 处理），分块间隔仍然由 `--chunk-delay` 控制。
 
 ```bash
 # 重试失败的离线任务
@@ -265,9 +273,37 @@ rss2pan --retry-failed --chunk-size 50 --chunk-delay 3
 ```
 
 - `--retry-failed` 和 `--clear-task-type` 不能同时使用。
+- `--retry-failed` 可以和 `--retry-failed-json` 一起用：先重试 115 上的失败任务，再重试 `failed_tasks.json` 里的记录。
 - 结束后会打印失败任务数、清除数、仍然失败数、重新提交数（分别来自 `db.sqlite` 和 115 API）、115 仍认为存在的任务数以及提交失败数；有提交失败时退出码是 `1`。
 - 如果 `already existed` 不为 0，说明 115 还在用它自己的“重复链接”校验挡住这些连接，稍后再跑一次 `--retry-failed` 就行。
 - 数据库里没有记录的重试**不会**写回 `db.sqlite`。
+
+#### 提交失败记录
+
+- 115 的 `add_task_urls` 单次最多接受 115 条链接。程序始终按每批最多 115 条提交，`--chunk-size` 设置超过 115 时也会自动按 115 处理，多出来的链接分批次提交。
+- 每批提交失败时会自动重试 2 次（间隔 3 秒、6 秒）；最终仍失败的批次不会中断其它批次的提交（登录失效、离线次数用完时除外）。
+- 最终失败的链接会追加写入 `failed_tasks.json`，默认放在 `db.sqlite` 同一目录（数据库路径是相对路径时就是当前目录）。文件内容是 JSON，记录了创建时间、来源、`cid`、`savepath`、错误信息和失败的链接：
+
+```json
+{
+  "updated_at": "2026-10-21T17:30:00+08:00",
+  "failures": [
+    {
+      "created_at": "2026-10-21T17:30:00+08:00",
+      "source": "test",
+      "cid": "2479224057885794455",
+      "savepath": "番剧/测试",
+      "error": "unexpected 115 error (code 0): 单次最多添加115个链接",
+      "links": ["magnet:?xt=urn:btih:..."]
+    }
+  ]
+}
+```
+
+- 同一个文件会保留历史失败记录，新的失败批次追加到 `failures` 数组末尾。
+- `--retry-failed` 重新提交失败任务时同样遵守每批 115 条的上限和失败重试；最终仍失败的链接也会写入这个文件，命令结束时会打印文件路径。
+- `--retry-failed-json` 用来重试这个文件里记录的链接：默认读取 `db.sqlite` 旁的 `failed_tasks.json`，也可以把文件路径作为参数传入。提交成功（包括 115 报“任务已存在”）的链接会从文件里删掉，仍然失败的链接保留并更新错误信息；还有失败时退出码是 `1`。
+- 文件损坏时会先重命名为 `failed_tasks.json.bak-<时间>`，再重新生成，避免这次失败的链接丢失。
 
 #### 代理配置
 

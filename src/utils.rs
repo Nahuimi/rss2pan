@@ -6,7 +6,10 @@ use std::{
     process::Command,
 };
 
-use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono::{
+    DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, SecondsFormat, TimeZone, Timelike,
+    Utc,
+};
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use std::io::ErrorKind;
@@ -125,6 +128,13 @@ pub fn open_qrcode_image(path: &Path) -> anyhow::Result<()> {
 
 pub fn current_db_timestamp() -> String {
     format_db_timestamp(Utc::now())
+}
+
+/// 北京时间 RFC 3339 时间戳，用于 JSON 文件里的创建 / 更新时间。
+pub fn current_beijing_rfc3339() -> String {
+    Utc::now()
+        .with_timezone(&beijing_offset())
+        .to_rfc3339_opts(SecondsFormat::Secs, false)
 }
 
 pub fn format_db_timestamp<Tz: TimeZone>(datetime: DateTime<Tz>) -> String {

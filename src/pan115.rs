@@ -28,6 +28,8 @@ const API_QRCODE_STATUS_URL: &str = "https://qrcodeapi.115.com/get/status/";
 const API_QRCODE_LOGIN_URL: &str = "https://passportapi.115.com/app/1.0/%s/1.0/login/qrcode";
 const API_QRCODE_IMAGE_URL: &str =
     "https://qrcodeapi.115.com/api/1.0/web/1.0/qrcode?qrfrom=1&client=0&uid=%s";
+/// 115 `add_task_urls` 单次最多接受的链接数。
+pub const MAX_ADD_LINKS_PER_REQUEST: usize = 115;
 const APP_VER: &str = "27.0.5.7";
 const UA_115_BROWSER: &str = "Mozilla/5.0 115Browser/27.0.5.7";
 const REQUIRED_COOKIE_NAMES: [&str; 3] = ["UID", "CID", "SEID"];
@@ -228,6 +230,11 @@ impl Pan115Client {
             ajax,
             user_id: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// `db.sqlite` 的路径，失败记录 JSON 默认放在它旁边。
+    pub fn database_path(&self) -> PathBuf {
+        self.ajax.database_path()
     }
 
     fn req(&self, method: Method, url: &str) -> Result<RequestBuilder> {
@@ -546,6 +553,24 @@ impl Pan115Client {
     }
 
     pub async fn add_offline_urls(
+        &self,
+        uris: &[String],
+        dir_id: Option<&str>,
+        savepath: Option<&str>,
+    ) -> Result<Vec<String>> {
+        if uris.len() <= MAX_ADD_LINKS_PER_REQUEST {
+            return self.add_offline_urls_once(uris, dir_id, savepath).await;
+        }
+
+        // 兜底：即使调用方没分批，也不会因为超过 115 条被 115 拒绝。
+        let mut hashes = Vec::with_capacity(uris.len());
+        for chunk in uris.chunks(MAX_ADD_LINKS_PER_REQUEST) {
+            hashes.extend(self.add_offline_urls_once(chunk, dir_id, savepath).await?);
+        }
+        Ok(hashes)
+    }
+
+    async fn add_offline_urls_once(
         &self,
         uris: &[String],
         dir_id: Option<&str>,

@@ -39,7 +39,7 @@ pub fn build_app() -> Command {
                 .value_parser(value_parser!(u64)),
         )
         .arg(
-            arg!(--"chunk-size" [chunk_size] "chunk size for offline tasks")
+            arg!(--"chunk-size" [chunk_size] "chunk size for offline tasks (max 115)")
                 .value_parser(value_parser!(usize)),
         )
         .arg(
@@ -49,6 +49,16 @@ pub fn build_app() -> Command {
         .arg(
             arg!(--"retry-failed" "clear all failed 115 offline tasks with task_clear, then re-add them with the cid/savepath stored in db.sqlite")
                 .action(ArgAction::SetTrue)
+                .conflicts_with("clear-task-type"),
+        )
+        .arg(
+            Arg::new("retry-failed-json")
+                .long("retry-failed-json")
+                .help("retry links recorded in failed_tasks.json (optional path; default is next to db.sqlite)")
+                .value_name("failed_json")
+                .num_args(0..=1)
+                .default_missing_value("")
+                .value_parser(value_parser!(String))
                 .conflicts_with("clear-task-type"),
         )
         .subcommand(
@@ -161,6 +171,42 @@ fn t_new_flags() {
     assert_eq!(matches.get_one::<u64>("chunk-delay").copied(), Some(3));
     assert_eq!(matches.get_one::<usize>("chunk-size").copied(), Some(50));
     assert_eq!(matches.get_one::<u8>("clear-task-type").copied(), Some(2));
+}
+
+#[test]
+fn t_retry_failed_json_flag() {
+    let cmd = build_app();
+
+    let matches = cmd
+        .clone()
+        .try_get_matches_from(["rss2pan", "--retry-failed-json"])
+        .unwrap();
+    assert_eq!(
+        matches
+            .get_one::<String>("retry-failed-json")
+            .map(String::as_str),
+        Some("")
+    );
+
+    let matches = cmd
+        .clone()
+        .try_get_matches_from(["rss2pan", "--retry-failed-json", "custom.json"])
+        .unwrap();
+    assert_eq!(
+        matches
+            .get_one::<String>("retry-failed-json")
+            .map(String::as_str),
+        Some("custom.json")
+    );
+
+    // 可以和 --retry-failed 一起用，但不能和 --clear-task-type 一起用。
+    assert!(cmd
+        .clone()
+        .try_get_matches_from(["rss2pan", "--retry-failed", "--retry-failed-json"])
+        .is_ok());
+    assert!(cmd
+        .try_get_matches_from(["rss2pan", "--retry-failed-json", "--clear-task-type", "2"])
+        .is_err());
 }
 
 #[test]
